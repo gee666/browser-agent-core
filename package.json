@@ -1,0 +1,14 @@
+{
+  "name": "browser-agent-core",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Core library for browser agent automation",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0"
+  }
+}
