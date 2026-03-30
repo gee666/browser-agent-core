@@ -84,63 +84,145 @@ export async function refreshOpenAIToken(refreshToken) {
   };
 }
 
+// The Codex OAuth token is a ChatGPT subscription token.
+// It does NOT work with api.openai.com — it uses chatgpt.com/backend-api instead.
+const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
+
+/**
+ * Build the Codex SSE request body.
+ * Uses the OpenAI Responses API format (input array, not messages).
+ */
+function buildCodexBody(model, system, messages, screenshot) {
+  const input = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    const role = msg.role === 'assistant' ? 'assistant' : 'user';
+
+    if (role === 'assistant') {
+      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      input.push({ role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] });
+    } else {
+      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      const parts = [{ type: 'input_text', text }];
+
+      // Attach screenshot to the last user message only
+      const isLastUser = i === messages.map(m => m.role).lastIndexOf('user');
+      if (isLastUser && screenshot) {
+        parts.push({ type: 'input_image', detail: 'auto', image_url: screenshot });
+      }
+
+      input.push({ role: 'user', content: parts });
+    }
+  }
+
+  return {
+    model,
+    store: false,
+    stream: true,
+    instructions: system,
+    input,
+    text: { verbosity: 'medium' },
+    include: ['reasoning.encrypted_content'],
+    tool_choice: 'auto',
+    parallel_tool_calls: true,
+  };
+}
+
+/**
+ * Parse a Codex SSE streaming response and return the full text.
+ * Accumulates response.output_text.delta events.
+ */
+async function parseCodexSSE(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Events are separated by double newline
+      let idx = buffer.indexOf('\n\n');
+      while (idx !== -1) {
+        const chunk = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+
+        const dataLines = chunk.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim());
+
+        for (const data of dataLines) {
+          if (!data || data === '[DONE]') continue;
+          try {
+            const event = JSON.parse(data);
+            if (event.type === 'response.output_text.delta') {
+              fullText += event.delta || '';
+            } else if (event.type === 'error') {
+              throw new LLMError(`Codex error: ${event.message || JSON.stringify(event)}`);
+            } else if (event.type === 'response.failed') {
+              throw new LLMError(`Codex response failed: ${event.response?.error?.message || 'unknown'}`);
+            }
+          } catch (e) {
+            if (e instanceof LLMError) throw e;
+            // ignore JSON parse errors on individual chunks
+          }
+        }
+        idx = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    try { reader.cancel(); } catch {}
+  }
+
+  if (!fullText) throw new LLMError('Codex returned empty response');
+  return fullText;
+}
+
 /**
  * OpenAI Codex OAuth LLM provider.
- * Uses stored OAuth tokens instead of an API key.
- * Tokens are stored under 'openai-codex' in chrome.storage.local.
+ * Uses chatgpt.com/backend-api (NOT api.openai.com) — the Codex OAuth token
+ * is a ChatGPT subscription token and requires the chatgpt-account-id header.
  */
 export class OpenAICodexOAuthProvider extends LLMProvider {
-  constructor({ model = 'gpt-4o', maxTokens = 4096, temperature = 0.2 } = {}) {
+  constructor({ model = 'gpt-5.1', temperature = 0.2 } = {}) {
     super();
     this._model = model;
-    this._maxTokens = maxTokens;
     this._temperature = temperature;
   }
 
   async complete({ system, messages, screenshot }) {
     const tokens = await getValidTokens(PROVIDER_KEY, (rt) => refreshOpenAIToken(rt));
-    await storeTokens(PROVIDER_KEY, tokens); // save refreshed token
+    await storeTokens(PROVIDER_KEY, tokens);
 
-    // Build messages in OpenAI format
-    const builtMessages = [{ role: 'system', content: system }, ...messages];
+    const { access, accountId } = tokens;
+    if (!accountId) throw new OAuthError('Missing accountId in stored OpenAI token. Please re-login.');
 
-    // Add screenshot to last user message if provided
-    const supportsVision = /gpt-4o?|vision/i.test(this._model);
-    if (screenshot && supportsVision) {
-      const lastUserIdx = builtMessages.map(m => m.role).lastIndexOf('user');
-      if (lastUserIdx !== -1) {
-        const lastMsg = builtMessages[lastUserIdx];
-        const textContent = typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content);
-        builtMessages[lastUserIdx] = {
-          role: 'user',
-          content: [
-            { type: 'text', text: textContent },
-            { type: 'image_url', image_url: { url: screenshot } },
-          ],
-        };
-      }
-    }
+    const body = buildCodexBody(this._model, system, messages, screenshot);
+    if (this._temperature !== undefined) body.temperature = this._temperature;
 
-    const body = {
-      model: this._model,
-      messages: builtMessages,
-      max_tokens: this._maxTokens,
-      temperature: this._temperature,
-    };
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${tokens.access}`,
-        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${access}`,
+        'chatgpt-account-id': accountId,
+        'originator': 'pi',
+        'OpenAI-Beta': 'responses=experimental',
+        'accept': 'text/event-stream',
+        'content-type': 'application/json',
       },
       body: JSON.stringify(body),
     });
 
-    const text = await response.text();
-    if (!response.ok) throw new LLMError(`OpenAI OAuth request failed (${response.status}): ${text}`);
-    const json = JSON.parse(text);
-    return json.choices[0].message.content;
+    if (!response.ok) {
+      const text = await response.text();
+      throw new LLMError(`OpenAI OAuth request failed (${response.status}): ${text}`);
+    }
+
+    return parseCodexSSE(response);
   }
 
   static async isLoggedIn() {
