@@ -124,8 +124,6 @@ function buildCodexBody(model, system, messages, screenshot) {
     input,
     text: { verbosity: 'medium' },
     include: ['reasoning.encrypted_content'],
-    tool_choice: 'auto',
-    parallel_tool_calls: true,
   };
 }
 
@@ -188,10 +186,9 @@ async function parseCodexSSE(response) {
  * is a ChatGPT subscription token and requires the chatgpt-account-id header.
  */
 export class OpenAICodexOAuthProvider extends LLMProvider {
-  constructor({ model = 'gpt-5.1', temperature = 0.2 } = {}) {
+  constructor({ model = 'gpt-5.1' } = {}) {
     super();
     this._model = model;
-    this._temperature = temperature;
   }
 
   async complete({ system, messages, screenshot }) {
@@ -202,7 +199,6 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
     if (!accountId) throw new OAuthError('Missing accountId in stored OpenAI token. Please re-login.');
 
     const body = buildCodexBody(this._model, system, messages, screenshot);
-    if (this._temperature !== undefined) body.temperature = this._temperature;
 
     const response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
       method: 'POST',
