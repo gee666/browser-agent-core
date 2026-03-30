@@ -5,3 +5,7 @@ export { OllamaProvider } from './ollama.js';
 export { OpenRouterProvider } from './openrouter.js';
 export { NvidiaProvider } from './nvidia.js';
 export { LLMParseError, LLMError, parseJSONFromText, extractJsonBlock, buildImageContent } from './utils.js';
+export { OAuthError, generatePKCE, generateState, setPendingOAuth, setPendingOAuthTabId, getPendingOAuth, clearPendingOAuth, storeTokens, getTokens, clearTokens, getValidTokens, parseRedirectUrl, exchangeCode, decodeJwt } from './oauth.js';
+export { OpenAICodexOAuthProvider, buildOpenAIAuthUrl, exchangeOpenAICode, refreshOpenAIToken, OPENAI_REDIRECT_URI } from './openai-oauth.js';
+export { AnthropicOAuthProvider, buildAnthropicAuthUrl, exchangeAnthropicCode, refreshAnthropicToken, ANTHROPIC_REDIRECT_URI } from './anthropic-oauth.js';
+export { GeminiOAuthProvider, buildGeminiAuthUrl, exchangeGeminiCode, refreshGeminiToken, GEMINI_REDIRECT_URI } from './gemini-oauth.js';

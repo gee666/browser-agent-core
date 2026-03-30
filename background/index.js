@@ -7,3 +7,7 @@ export { AnthropicProvider } from './llm/anthropic.js';
 export { OllamaProvider } from './llm/ollama.js';
 export { OpenRouterProvider } from './llm/openrouter.js';
 export { NvidiaProvider } from './llm/nvidia.js';
+export { OAuthError, generatePKCE, generateState, setPendingOAuth, setPendingOAuthTabId, getPendingOAuth, clearPendingOAuth, storeTokens as storeOAuthTokens, getTokens as getOAuthTokens, clearTokens as clearOAuthTokens, getValidTokens, parseRedirectUrl } from './llm/oauth.js';
+export { OpenAICodexOAuthProvider, buildOpenAIAuthUrl, exchangeOpenAICode, refreshOpenAIToken, OPENAI_REDIRECT_URI } from './llm/openai-oauth.js';
+export { AnthropicOAuthProvider, buildAnthropicAuthUrl, exchangeAnthropicCode, refreshAnthropicToken, ANTHROPIC_REDIRECT_URI } from './llm/anthropic-oauth.js';
+export { GeminiOAuthProvider, buildGeminiAuthUrl, exchangeGeminiCode, refreshGeminiToken, GEMINI_REDIRECT_URI } from './llm/gemini-oauth.js';
