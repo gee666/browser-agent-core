@@ -75,8 +75,11 @@ export class BrowserBridge {
   }
 
   async navigate(url, timeoutMs = 30_000) {
-    const tab = await new Promise((resolve, reject) => {
-      chrome.tabs.update({ url }, (updatedTab) => {
+    // Get active tab id first so we have it for the navigation listener
+    const activeTabId = await this.getActiveTabId();
+
+    await new Promise((resolve, reject) => {
+      chrome.tabs.update(activeTabId, { url }, (updatedTab) => {
         if (chrome.runtime.lastError) {
           return reject(new BridgeError(chrome.runtime.lastError.message));
         }
@@ -84,7 +87,7 @@ export class BrowserBridge {
       });
     });
 
-    const tabId = tab.id;
+    const tabId = activeTabId;
 
     await new Promise((resolve, reject) => {
       let timer;
@@ -109,6 +112,14 @@ export class BrowserBridge {
   }
 
   async waitForPageSettle(tabId, ms = 3000) {
+    // If no tabId provided, fall back to active tab
+    if (tabId == null) {
+      tabId = await this.getActiveTabId().catch(() => null);
+    }
+    if (tabId == null) {
+      // Nothing we can do — just wait the fallback delay
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(), ms);
 
