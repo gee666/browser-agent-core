@@ -218,6 +218,7 @@ export class GeminiOAuthProvider extends LLMProvider {
         generationConfig: {
           maxOutputTokens: this._maxTokens,
           temperature: this._temperature,
+          responseMimeType: 'application/json',
         },
       },
       userAgent: 'pi-coding-agent',

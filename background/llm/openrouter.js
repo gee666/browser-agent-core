@@ -51,6 +51,7 @@ export class OpenRouterProvider extends LLMProvider {
         messages: builtMessages,
         max_tokens: this.maxTokens,
         temperature: this.temperature,
+        response_format: { type: 'json_object' },
       }),
     });
 

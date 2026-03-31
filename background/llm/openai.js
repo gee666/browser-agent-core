@@ -1,4 +1,11 @@
 import { LLMProvider } from './base.js';
+
+/** Returns true for OpenAI models that support response_format:json_object. */
+function _supportsJsonMode(model) {
+  // Exclude o1/o3/o4 reasoning models — they don't accept response_format.
+  if (/^o\d/i.test(model)) return false;
+  return true;
+}
 import { LLMError, buildImageContent } from './utils.js';
 
 export class OpenAIProvider extends LLMProvider {
@@ -49,6 +56,7 @@ export class OpenAIProvider extends LLMProvider {
         messages: builtMessages,
         max_tokens: this.maxTokens,
         temperature: this.temperature,
+        ...(_supportsJsonMode(this.model) ? { response_format: { type: 'json_object' } } : {}),
       }),
     });
 

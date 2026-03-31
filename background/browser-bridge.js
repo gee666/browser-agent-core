@@ -132,6 +132,54 @@ export class BrowserBridge {
     });
   }
 
+  /**
+   * Scroll the element with the given extractor index into the viewport by calling
+   * element.scrollIntoView() on the real DOM node inside the content script.
+   *
+   * This is the most reliable scroll method: it works with nested scroll containers,
+   * fixed/sticky ancestors, and pages that override window.scrollTo.
+   *
+   * @param {number} tabId
+   * @param {number} index  - extractor element index
+   * @returns {Promise<boolean>} true if the element was found and scrolled
+   */
+  async scrollElementIntoView(tabId, index) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 3000);
+      chrome.tabs.sendMessage(tabId, { type: 'scroll_to_index', index }, (response) => {
+        clearTimeout(timer);
+        void chrome.runtime.lastError; // suppress unchecked error
+        resolve(response?.ok === true);
+      });
+    });
+  }
+
+  /**
+   * Scroll the tab to an absolute page position using window.scrollTo (pixel-perfect).
+   * This is used by the executor to bring elements into the viewport before clicking.
+   * Unlike native wheel events, this scrolls the exact number of pixels requested.
+   * @param {number} tabId
+   * @param {number} scrollX  - target window.scrollX
+   * @param {number} scrollY  - target window.scrollY
+   */
+  async scrollToPosition(tabId, scrollX, scrollY) {
+    return new Promise((resolve, reject) => {
+      chrome.scripting.executeScript(
+        {
+          target: { tabId },
+          func: (sx, sy) => window.scrollTo({ left: sx, top: sy, behavior: 'instant' }),
+          args: [Math.max(0, Math.round(scrollX)), Math.max(0, Math.round(scrollY))],
+        },
+        () => {
+          if (chrome.runtime.lastError) {
+            return reject(new BridgeError(chrome.runtime.lastError.message));
+          }
+          resolve();
+        },
+      );
+    });
+  }
+
   sendStatus(status) {
     chrome.storage.local.set({ agentStatus: status });
 

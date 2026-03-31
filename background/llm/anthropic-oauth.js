@@ -127,7 +127,7 @@ export class AnthropicOAuthProvider extends LLMProvider {
       max_tokens: this._maxTokens,
       temperature: this._temperature,
       system,
-      messages: anthropicMessages,
+      messages: [...anthropicMessages, { role: 'assistant', content: '{' }],
     };
 
     // Anthropic OAuth access tokens (sk-ant-oat01-...) are used as API keys,
@@ -145,7 +145,7 @@ export class AnthropicOAuthProvider extends LLMProvider {
     const text = await response.text();
     if (!response.ok) throw new LLMError(`Anthropic OAuth request failed (${response.status}): ${text}`);
     const json = JSON.parse(text);
-    return json.content[0].text;
+    return '{' + json.content[0].text;
   }
 
   static async isLoggedIn() {

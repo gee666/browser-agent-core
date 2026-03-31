@@ -13,7 +13,6 @@ function loadExtractor() {
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
-/** Default non-zero rect so visibility checks pass. */
 const VISIBLE_RECT = {
   width: 100,
   height: 40,
@@ -26,19 +25,15 @@ const VISIBLE_RECT = {
 let messageHandler;
 
 beforeAll(() => {
-  // Set a viewport size so inViewport calculations work predictably.
-  Object.defineProperty(window, 'innerWidth', { value: 1024, writable: true, configurable: true });
-  Object.defineProperty(window, 'innerHeight', { value: 768, writable: true, configurable: true });
+  Object.defineProperty(window, 'innerWidth',  { value: 1024, writable: true, configurable: true });
+  Object.defineProperty(window, 'innerHeight', { value: 768,  writable: true, configurable: true });
 
-  // jsdom does not implement innerText (it depends on CSS layout). Polyfill with textContent.
+  // jsdom does not implement innerText; polyfill with textContent.
   Object.defineProperty(HTMLElement.prototype, 'innerText', {
-    get() {
-      return this.textContent ?? '';
-    },
+    get() { return this.textContent ?? ''; },
     configurable: true,
   });
 
-  // jsdom may not expose CSS.escape as a plain global inside eval'd code.
   if (typeof globalThis.CSS === 'undefined') {
     globalThis.CSS = {
       escape: (str) =>
@@ -46,15 +41,12 @@ beforeAll(() => {
     };
   }
 
-  // Evaluate the IIFE once — it registers the onMessage listener on the mocked chrome.
   loadExtractor();
   messageHandler = chrome.runtime.onMessage.addListener.mock.calls[0][0];
 });
 
 beforeEach(() => {
   document.body.innerHTML = '';
-
-  // Make all elements visually non-zero by default so the rect check passes.
   jest
     .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
     .mockReturnValue({ ...VISIBLE_RECT });
@@ -64,161 +56,155 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-/** Invoke the get_page_state handler and return the synchronous response. */
+/** Invoke get_page_state and return the synchronous response. */
 function getPageState() {
   let response;
-  messageHandler({ type: 'get_page_state' }, {}, (r) => {
-    response = r;
-  });
+  messageHandler({ type: 'get_page_state' }, {}, (r) => { response = r; });
   return response;
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 describe('extractor', () => {
-  test('test_button_extracted', () => {
+
+  // 1. button appears as [N]<button>text</button> in domText
+  test('test_domText_contains_button_with_index', () => {
     document.body.innerHTML = '<button>Click me</button>';
-    const { elements } = getPageState();
-    expect(elements).toContainEqual(
-      expect.objectContaining({ tag: 'BUTTON', text: 'Click me', role: 'button', enabled: true }),
-    );
+    const { domText } = getPageState();
+    // May be prefixed with '*' if element is new — '[0]<button>Click me</button>' is a substring either way
+    expect(domText).toContain('[0]<button>Click me</button>');
   });
 
-  test('test_input_with_for_label', () => {
-    document.body.innerHTML = '<label for="e">Email</label><input id="e" type="email">';
+  // 2. rect uses .w and .h keys, not .width / .height
+  test('test_elements_array_has_rect_with_w_h', () => {
+    document.body.innerHTML = '<button>Test</button>';
     const { elements } = getPageState();
-    const input = elements.find((el) => el.tag === 'INPUT');
-    expect(input).toBeDefined();
-    expect(input.label).toBe('Email');
+    expect(elements.length).toBeGreaterThan(0);
+    expect(elements[0].rect).toHaveProperty('w');
+    expect(elements[0].rect).toHaveProperty('h');
+    expect(elements[0].rect).not.toHaveProperty('width');
+    expect(elements[0].rect).not.toHaveProperty('height');
   });
 
-  test('test_input_with_aria_label', () => {
-    document.body.innerHTML = '<input aria-label="Search">';
-    const { elements } = getPageState();
-    expect(elements[0].label).toBe('Search');
+  // 3. new element marked with '*'; same element on subsequent call is not new
+  test('test_new_element_marked_with_star', () => {
+    document.body.innerHTML = '<button>Old</button>';
+
+    // First call: element has never been seen → isNew: true → '*[0]' in domText
+    let state = getPageState();
+    expect(state.elements[0].isNew).toBe(true);
+    expect(state.domText).toContain('*[0]');
+
+    // Second call: same DOM element is now in seenElements → isNew: false
+    state = getPageState();
+    expect(state.elements[0].isNew).toBe(false);
+    expect(state.domText).not.toContain('*[0]');
+
+    // Append a brand-new element; it has never been seen
+    const newBtn = document.createElement('button');
+    newBtn.textContent = 'New';
+    document.body.appendChild(newBtn);
+
+    state = getPageState();
+    const newEl = state.elements.find((e) => e.text === 'New');
+    expect(newEl).toBeDefined();
+    expect(newEl.isNew).toBe(true);
+    expect(state.domText).toContain('*[1]');
   });
 
-  test('test_input_with_aria_labelledby', () => {
-    document.body.innerHTML = '<span id="s">Username</span><input aria-labelledby="s">';
-    const { elements } = getPageState();
-    const input = elements.find((el) => el.tag === 'INPUT');
-    expect(input.label).toBe('Username');
-  });
+  // 4. element with scrollHeight > clientHeight + 4 and overflow:auto gets scrollInfo
+  test('test_scrollable_element_has_scroll_info', () => {
+    document.body.innerHTML = '<button>Scroll</button>';
+    const btn = document.querySelector('button');
 
-  test('test_input_with_placeholder_fallback', () => {
-    document.body.innerHTML = '<input placeholder="Enter email">';
-    const { elements } = getPageState();
-    expect(elements[0].label).toBe('Enter email');
-  });
+    Object.defineProperty(btn, 'scrollHeight', { value: 500, configurable: true });
+    Object.defineProperty(btn, 'clientHeight', { value: 100, configurable: true });
+    Object.defineProperty(btn, 'scrollTop',    { value: 0,   configurable: true });
+    Object.defineProperty(btn, 'scrollWidth',  { value: 100, configurable: true });
+    Object.defineProperty(btn, 'clientWidth',  { value: 100, configurable: true });
 
-  test('test_hidden_element_excluded', () => {
-    document.body.innerHTML = '<button style="display:none">Hidden</button>';
-    const { elements } = getPageState();
-    expect(elements.find((el) => el.text === 'Hidden')).toBeUndefined();
-  });
-
-  test('test_visibility_hidden_excluded', () => {
-    document.body.innerHTML = '<button style="visibility:hidden">Invisible</button>';
-    const { elements } = getPageState();
-    expect(elements.find((el) => el.text === 'Invisible')).toBeUndefined();
-  });
-
-  test('test_zero_size_excluded', () => {
-    document.body.innerHTML = '<button>Zero</button>';
-
-    // Override default mock with zero rect for this test.
-    jest.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
-      width: 0,
-      height: 0,
-      top: 0,
-      bottom: 0,
-      left: 0,
-      right: 0,
+    jest.spyOn(window, 'getComputedStyle').mockReturnValue({
+      display: 'block', visibility: 'visible', pointerEvents: 'auto',
+      cursor: 'default', overflowY: 'auto', overflowX: 'visible',
     });
 
     const { elements } = getPageState();
-    expect(elements.find((el) => el.text === 'Zero')).toBeUndefined();
+    expect(elements.length).toBeGreaterThan(0);
+    expect(elements[0].scrollInfo).not.toBeNull();
+    // bottom = scrollHeight(500) − clientHeight(100) − scrollTop(0) = 400
+    expect(elements[0].scrollInfo.bottom).toBe(400);
   });
 
-  test('test_disabled_included_but_flagged', () => {
-    document.body.innerHTML = '<button disabled>Disabled</button>';
+  // 5. response has a domText string field
+  test('test_get_page_state_has_domText', () => {
+    const state = getPageState();
+    expect(state).toHaveProperty('domText');
+    expect(typeof state.domText).toBe('string');
+  });
+
+  // 6. response has an elements array field
+  test('test_get_page_state_has_elements', () => {
+    const state = getPageState();
+    expect(state).toHaveProperty('elements');
+    expect(Array.isArray(state.elements)).toBe(true);
+  });
+
+  // 7. element with display:none is excluded
+  test('test_hidden_element_excluded', () => {
+    // jsdom handles inline display:none in getComputedStyle natively; no mock needed
+    document.body.innerHTML = '<button style="display:none">Hidden</button>';
     const { elements } = getPageState();
-    // Find by tag since innerText-based text field maps to textContent via polyfill.
-    const btn = elements.find((el) => el.tag === 'BUTTON' && el.text === 'Disabled');
-    expect(btn).toBeDefined();
-    expect(btn.enabled).toBe(false);
+    expect(elements.find((e) => e.text === 'Hidden')).toBeUndefined();
   });
 
-  test('test_select_extracted', () => {
-    document.body.innerHTML = '<select><option>A</option></select>';
-    const { elements } = getPageState();
-    expect(elements).toContainEqual(
-      expect.objectContaining({ tag: 'SELECT', role: 'combobox' }),
-    );
-  });
-
-  test('test_contenteditable_extracted', () => {
-    document.body.innerHTML = '<div contenteditable="true">editable</div>';
-    const { elements } = getPageState();
-    expect(elements).toContainEqual(expect.objectContaining({ role: 'textbox' }));
-  });
-
+  // 8. element inside viewport has inViewport: true
   test('test_inviewport_true_for_visible', () => {
     document.body.innerHTML = '<button>In Viewport</button>';
-    // Default rect: top=10, left=10, well inside 1024×768.
+    // Default rect: top=10, bottom=50 — well inside 1024×768
     const { elements } = getPageState();
-    const btn = elements.find((el) => el.tag === 'BUTTON' && el.text === 'In Viewport');
+    const btn = elements.find((e) => e.text === 'In Viewport');
     expect(btn).toBeDefined();
     expect(btn.inViewport).toBe(true);
   });
 
+  // 9. element below the fold has inViewport: false
   test('test_inviewport_false_for_below_fold', () => {
     document.body.innerHTML = '<button>Below Fold</button>';
     jest.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
-      width: 100,
-      height: 40,
-      top: 2000,
-      bottom: 2040,
-      left: 10,
-      right: 110,
+      width: 100, height: 40, top: 2000, bottom: 2040, left: 10, right: 110,
     });
     const { elements } = getPageState();
-    const btn = elements.find((el) => el.tag === 'BUTTON' && el.text === 'Below Fold');
+    const btn = elements.find((e) => e.text === 'Below Fold');
     expect(btn).toBeDefined();
     expect(btn.inViewport).toBe(false);
   });
 
-  test('test_get_page_state_shape', () => {
-    const response = getPageState();
-    for (const key of [
-      'url',
-      'title',
-      'elements',
-      'context',
-      'viewportWidth',
-      'viewportHeight',
-      'pageWidth',
-      'pageHeight',
-    ]) {
-      expect(response).toHaveProperty(key);
-    }
+  // 10. div with role=button is extracted as an interactive element
+  test('test_interactive_by_aria_role', () => {
+    document.body.innerHTML = '<div role="button">Custom Button</div>';
+    const { elements } = getPageState();
+    expect(elements.length).toBeGreaterThan(0);
+    expect(elements[0].tag).toBe('div');
+    expect(elements[0].attrs.role).toBe('button');
   });
 
-  test('test_duplicate_elements_deduped', () => {
-    // This element matches both the 'button' selector and '[role=button]'.
-    document.body.innerHTML = '<button role="button">Test</button>';
+  // 11. multiple siblings get sequential indices 0, 1, 2 in DFS order
+  test('test_index_assignment_sequential', () => {
+    document.body.innerHTML = '<button>A</button><button>B</button><button>C</button>';
     const { elements } = getPageState();
-    // With innerText polyfill, text field equals textContent.
-    const matches = elements.filter((el) => el.tag === 'BUTTON' && el.text === 'Test');
-    expect(matches).toHaveLength(1);
+    expect(elements).toHaveLength(3);
+    expect(elements[0].index).toBe(0);
+    expect(elements[1].index).toBe(1);
+    expect(elements[2].index).toBe(2);
   });
 
-  test('test_deeply_nested_label', () => {
-    document.body.innerHTML = '<label><span>Name</span><input type="text"></label>';
-    const { elements } = getPageState();
-    const input = elements.find((el) => el.tag === 'INPUT');
-    expect(input).toBeDefined();
-    // The extractor walks up to the ancestor <label> and uses its textContent.
-    expect(input.label).toBe('Name');
-  });
+  // 12. wait_for_settle message resolves with { settled: true }
+  test('test_wait_for_settle_resolves', async () => {
+    let settled = null;
+    messageHandler({ type: 'wait_for_settle' }, {}, (r) => { settled = r; });
+    // waitForSettle(500) fires after 500 ms; wait 600 ms to be safe
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(settled).toEqual({ settled: true });
+  }, 10000);
+
 });

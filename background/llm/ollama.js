@@ -41,6 +41,7 @@ export class OllamaProvider extends LLMProvider {
         model: this.model,
         messages: builtMessages,
         temperature: this.temperature,
+        format: 'json',
       }),
     });
 

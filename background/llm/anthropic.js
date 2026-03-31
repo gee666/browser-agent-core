@@ -51,7 +51,7 @@ export class AnthropicProvider extends LLMProvider {
       body: JSON.stringify({
         model: this.model,
         system,
-        messages: anthropicMessages,
+        messages: [...anthropicMessages, { role: 'assistant', content: '{' }],
         max_tokens: this.maxTokens,
         temperature: this.temperature,
       }),
@@ -63,6 +63,6 @@ export class AnthropicProvider extends LLMProvider {
     }
 
     const data = await response.json();
-    return data.content[0].text;
+    return '{' + data.content[0].text;
   }
 }

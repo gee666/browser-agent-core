@@ -126,9 +126,10 @@ describe('AnthropicProvider', () => {
     const p = new AnthropicProvider({ apiKey: 'k' });
     await p.complete({ system: 's', messages: [{ role: 'user', content: 'hi' }], screenshot: SCREENSHOT });
     const body = JSON.parse(fetch.mock.calls[0][1].body);
-    const last = body.messages[body.messages.length - 1];
-    expect(Array.isArray(last.content)).toBe(true);
-    expect(last.content).toContainEqual(expect.objectContaining({ type: 'image' }));
+    // Last message is the assistant prefill '{'; screenshot is in the user message before it.
+    const userMsg = body.messages[body.messages.length - 2];
+    expect(Array.isArray(userMsg.content)).toBe(true);
+    expect(userMsg.content).toContainEqual(expect.objectContaining({ type: 'image' }));
   });
 
   test('omits_screenshot_when_null', async () => {
@@ -150,7 +151,7 @@ describe('AnthropicProvider', () => {
       messages: [{ role: 'user', content: 'hi' }],
       screenshot: null,
     });
-    expect(result).toBe('test response');
+    expect(result).toBe('{test response');
   });
 
   test('throws_on_non_200', async () => {

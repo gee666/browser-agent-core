@@ -1,17 +1,24 @@
-import { parseJSONFromText, LLMParseError } from './llm/utils.js';
+import { parseJSONFromText } from './llm/utils.js';
 
 /**
- * AgentCore orchestrates the LLM reasoning loop for browser automation.
+ * AgentCore orchestrates the LLM reasoning loop for browser automation (v2).
+ *
+ * v2 changes vs v1:
+ *  - History is a rolling array of step summaries (not full DOM messages).
+ *  - LLM always receives a single user message per call with embedded history.
+ *  - LLM response shape: { evaluation_previous_goal, memory, next_goal, action: { NAME: params } }
+ *  - `done` is action.done, not a top-level field.
+ *  - Executor receives a single action object, not an array.
  */
 export class AgentCore {
   /**
    * @param {object} options
-   * @param {object} options.bridge       - BrowserBridge instance
-   * @param {object} options.executor     - ActionExecutor instance
-   * @param {object} options.llm          - LLMProvider instance
+   * @param {object} options.bridge           - BrowserBridge instance
+   * @param {object} options.executor         - ActionExecutor instance
+   * @param {object} options.llm              - LLMProvider instance
    * @param {number} [options.maxIterations=20]
    * @param {boolean} [options.useVision=false]
-   * @param {function} [options.onStatus] - Called with {state, ...} on each state change
+   * @param {function} [options.onStatus]     - Called with {state, ...} on each state change
    */
   constructor({
     bridge,
@@ -28,6 +35,7 @@ export class AgentCore {
     this._useVision = useVision;
     this._onStatus = onStatus;
     this._stopped = false;
+    this._history = [];
   }
 
   /** Signal the running loop to stop after the current iteration. */
@@ -35,11 +43,6 @@ export class AgentCore {
     this._stopped = true;
   }
 
-  /**
-   * Run the agent loop for the given task.
-   * @param {string} task
-   * @returns {Promise<string|null>} The done message from the LLM, or null.
-   */
   _status(extra) {
     const s = {
       task: this._task || null,
@@ -48,7 +51,6 @@ export class AgentCore {
       url: this._url || null,
       title: this._title || null,
       message: null,
-      actionsCount: null,
       timestamp: Date.now(),
       ...extra,
     };
@@ -56,12 +58,22 @@ export class AgentCore {
     this._bridge.sendStatus(s);
   }
 
+  _sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  /**
+   * Run the agent loop for the given task.
+   * @param {string} task
+   * @returns {Promise<string|null>} The done message from the LLM, or null.
+   */
   async run(task) {
     this._stopped = false;
     this._task = task;
     this._iteration = 0;
     this._url = null;
     this._title = null;
+    this._history = [];
 
     this._status({ state: 'running' });
 
@@ -72,10 +84,8 @@ export class AgentCore {
       await this._bridge.waitForPageSettle();
     }
 
-    const messageHistory = [];
-
-    for (let iteration = 0; iteration < this._maxIterations; iteration++) {
-      this._iteration = iteration;
+    for (let stepNum = 0; stepNum < this._maxIterations; stepNum++) {
+      this._iteration = stepNum;
 
       if (this._stopped) {
         this._status({ state: 'stopped' });
@@ -94,166 +104,293 @@ export class AgentCore {
 
       this._status({ state: 'thinking' });
 
-      const userMsg = this.buildUserMessage(task, pageState, iteration, messageHistory);
+      const userMsg = this._assembleUserMessage(task, pageState, stepNum);
 
-      // Store ONLY text in history — never store screenshots.
-      // Screenshots are large (1–3 MB base64) and accumulate fast.
-      // The current screenshot is passed separately to complete() so each
-      // provider can attach it only to the latest message.
-      messageHistory.push({ role: 'user', content: userMsg });
+      // Call LLM with a single-message array; history is embedded in the user message text.
+      let raw = await this._llm.complete({
+        system: this.systemPrompt(),
+        messages: [{ role: 'user', content: userMsg }],
+        screenshot,
+      });
 
-      // Cap history at 6 pairs (12 messages) — pages have large element lists
-      const cappedHistory = messageHistory.slice(-12);
-
-      // Call LLM, with one retry on JSON parse failure.
+      // ── Parse JSON (with one retry on failure) ─────────────────────────────
       let parsed = null;
-      let raw = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        parsed = parseJSONFromText(raw);
+      } catch (_) {
+        // First parse failed — send the bad response back and ask for valid JSON.
         raw = await this._llm.complete({
           system: this.systemPrompt(),
-          messages: cappedHistory,
-          screenshot, // providers attach this only to the last user message
+          messages: [
+            { role: 'user',      content: userMsg },
+            { role: 'assistant', content: raw },
+            { role: 'user',      content: 'Your response was not valid JSON. Reply with ONLY a raw JSON object — no prose, no markdown, no code fences.' },
+          ],
+          screenshot: null,
         });
         try {
           parsed = parseJSONFromText(raw);
-          break;
-        } catch (e) {
-          if (attempt === 1) {
-            this._status({ state: 'error', message: `JSON parse failed: ${e.message}` });
-            return null;
-          }
-          // Retry: ask LLM to return valid JSON
-          messageHistory.push({ role: 'assistant', content: raw });
-          messageHistory.push({ role: 'user', content: 'Your response was not valid JSON. Please respond with ONLY a JSON object, no prose or markdown.' });
+        } catch (e2) {
+          this._status({ state: 'error', message: `JSON parse failed: ${e2.message}` });
+          return null;
         }
       }
 
-      messageHistory.push({ role: 'assistant', content: raw });
-
-      if (parsed.done) {
-        this._status({ state: 'done', message: parsed.message ?? null });
-        return parsed.message ?? null;
+      // ── Validate action (with one retry if invalid) ────────────────────────
+      const validationError = this._validateAction(parsed.action, pageState);
+      if (validationError) {
+        raw = await this._llm.complete({
+          system: this.systemPrompt(),
+          messages: [
+            { role: 'user',      content: userMsg },
+            { role: 'assistant', content: raw },
+            { role: 'user',      content: `Invalid action: ${validationError}` },
+          ],
+          screenshot: null,
+        });
+        try {
+          parsed = parseJSONFromText(raw);
+        } catch (e2) {
+          this._status({ state: 'error', message: `JSON parse failed after validation retry: ${e2.message}` });
+          return null;
+        }
+        // If it's still invalid after the retry we let the executor surface the
+        // error rather than looping forever.
       }
 
-      const actions = parsed.actions || [];
-      this._status({ state: 'acting', actionsCount: actions.length });
+      // Append step summary to history (cap at 15 entries).
+      const histEntry = {
+        stepNumber: stepNum,
+        evaluation: parsed.evaluation_previous_goal || '',
+        memory: parsed.memory || '',
+        nextGoal: parsed.next_goal || '',
+        actionResult: '',
+      };
 
-      if (actions.length > 0) {
-        await this._executor.execute(actions, pageState);
+      // Step warnings: modify actionResult of the current entry.
+      const stepsRemaining = this._maxIterations - stepNum;
+      if (stepsRemaining === 5) {
+        histEntry.actionResult =
+          '<sys>Warning: only 5 steps remaining. Prioritise completion.</sys>';
+      } else if (stepsRemaining === 2) {
+        histEntry.actionResult =
+          '<sys>CRITICAL: only 2 steps left. Call done() now even if incomplete.</sys>';
       }
 
-      await new Promise(r => setTimeout(r, 1500));
+      this._history.push(histEntry);
+      if (this._history.length > 15) {
+        this._history.shift();
+      }
+
+      const action = parsed.action || {};
+
+      if (action.done) {
+        this._status({ state: 'done', message: action.done.message ?? null });
+        return action.done.message ?? null;
+      }
+
+      this._status({ state: 'acting', actionsCount: 1 });
+
+      try {
+        await this._executor.execute(action, pageState);
+        // Record what ran so the LLM knows the action succeeded.
+        // Without this, models repeat the same action every step because they
+        // see an empty Action Result and assume nothing happened.
+        const [actionName, actionParams] = Object.entries(action)[0];
+        histEntry.actionResult = `Executed ${actionName}: ${JSON.stringify(actionParams)}`;
+        // Wait for any triggered navigation or DOM update to settle.
+        const tabId2 = await this._bridge.getActiveTabId();
+        await this._bridge.waitForPageSettle(tabId2, 1500);
+      } catch (err) {
+        if (err.name === 'ExecutorError') {
+          // Recoverable: record the failure in history so the LLM can adapt
+          // (e.g. stale index, element off-screen, page changed).
+          // Do NOT abort — let the agent try a different approach next step.
+          histEntry.actionResult = `Action failed: ${err.message}`;
+          this._status({ state: 'error', message: err.message });
+          // continue to next iteration
+        } else {
+          throw err; // unexpected — propagate
+        }
+      }
+
+      await this._sleep(1500);
     }
 
     this._status({ state: 'error', message: 'Max iterations reached' });
     return null;
   }
 
-  systemPrompt() {
-    return `You are a browser automation agent that controls a real web browser by emitting structured JSON commands.
+  /**
+   * Assemble the single user message sent to the LLM each step.
+   * Embeds task context, rolling history, and current browser state.
+   */
+  _assembleUserMessage(task, pageState, stepNum) {
+    const sections = [];
 
-═══════════════════════════════════════════════
-OUTPUT FORMAT — MANDATORY, NO EXCEPTIONS
-═══════════════════════════════════════════════
-Every single response MUST be a raw JSON object and nothing else.
-No prose. No explanations. No markdown. No code fences. No apologies.
-Not even one word outside the JSON.
+    sections.push(
+      `<agent_state>\n` +
+      `<user_request>\n${task}\n</user_request>\n` +
+      `<step_info>\nStep ${stepNum + 1} of ${this._maxIterations}. ` +
+      `Time: ${new Date().toLocaleString()}\n</step_info>\n` +
+      `</agent_state>`
+    );
 
-If you refuse, explain inside the JSON "message" field — still as JSON.
-If you are uncertain, still output JSON and navigate to find out.
-If the task seems sensitive or private, still output JSON — you are controlling
-a real browser where the human user is already logged in.
+    if (this._history.length > 0) {
+      const histLines = this._history.map(h =>
+        `<step_${h.stepNumber}>\n` +
+        `Evaluation: ${h.evaluation}\n` +
+        `Memory: ${h.memory}\n` +
+        `Next Goal: ${h.nextGoal}\n` +
+        `Action Result: ${h.actionResult}\n` +
+        `</step_${h.stepNumber}>`
+      ).join('\n');
+      sections.push(`<agent_history>\n${histLines}\n</agent_history>`);
+    }
 
-TWO VALID RESPONSE SHAPES — pick exactly one:
+    const pageHeader =
+      `Current Page: ${pageState.title} — ${pageState.url}\n` +
+      `Viewport: ${pageState.viewportWidth}×${pageState.viewportHeight}px, ` +
+      `page ${pageState.pageWidth}×${pageState.pageHeight}px, ` +
+      `scroll (${pageState.scrollX || 0}, ${pageState.scrollY || 0})`;
 
-Shape A — more steps needed:
-{"done":false,"reasoning":"one sentence","actions":[...one or more action objects...]}
+    const validIndices = (pageState.elements || []).map(e => e.index);
+    const indicesLine = validIndices.length > 0
+      ? `Valid element indices on this page: [${validIndices.join(', ')}]`
+      : '(No interactive elements detected on this page)';
 
-Shape B — task finished:
-{"done":true,"message":"what was accomplished or why it cannot be done"}
+    sections.push(
+      `<browser_state>\n${pageHeader}\n\n${pageState.domText || '(no page content)'}\n\n${indicesLine}\n</browser_state>`
+    );
 
-═══════════════════════════════════════════════
-ACTION OBJECTS
-═══════════════════════════════════════════════
-Every action is an object with "command" and "params".
-
-Navigate to a URL (always do this first if a URL is in the task):
-  {"command":"navigate","params":{"url":"https://example.com"}}
-
-Move mouse smoothly before clicking (always required before mouse_click):
-  {"command":"mouse_move","params":{"x":320,"y":150,"duration_ms":400}}
-
-Left-click:
-  {"command":"mouse_click","params":{"x":320,"y":150}}
-
-Right-click:
-  {"command":"mouse_click","params":{"x":320,"y":150,"button":"right"}}
-
-Double-click:
-  {"command":"mouse_click","params":{"x":320,"y":150,"count":2}}
-
-Type text (always click the field first):
-  {"command":"type","params":{"text":"hello@example.com","wpm":80}}
-
-Press a single key:
-  {"command":"press_key","params":{"key":"Enter"}}
-  {"command":"press_key","params":{"key":"Tab"}}
-  {"command":"press_key","params":{"key":"Escape"}}
-
-Keyboard shortcut:
-  {"command":"press_shortcut","params":{"keys":["control","a"]}}
-
-Scroll the page:
-  {"command":"scroll","params":{"x":640,"y":400,"delta_x":0,"delta_y":300,"duration_ms":400}}
-
-Wait briefly between action groups:
-  {"command":"pause","params":{"duration_ms":300}}
-
-═══════════════════════════════════════════════
-STRICT RULES
-═══════════════════════════════════════════════
-1. ALWAYS emit mouse_move to the same (x,y) immediately before mouse_click.
-2. NEVER click coordinates where inViewport is false — scroll first to bring the element into view.
-3. ALWAYS click a text field before typing into it.
-4. Use coordinates from the elements list: center_x = rect.x + rect.width/2, center_y = rect.y + rect.height/2.
-5. If a CAPTCHA appears or a required login is missing, set done:true and describe it in message.
-6. Emit a pause (200–400 ms) between logically separate groups of actions.
-7. Keep "reasoning" to one short factual sentence.`;
+    return sections.join('\n\n');
   }
 
-  buildUserMessage(task, pageState, iteration, history) {
-    const { url, title, elements = [], viewportWidth = 0, viewportHeight = 0, context = {} } = pageState;
-    const sx = Math.round(context.scrollX || 0);
-    const sy = Math.round(context.scrollY || 0);
+  /**
+   * Validates that the parsed action is structurally sound and references
+   * element indices that actually exist in the current page state.
+   *
+   * Returns null when valid, or a plain-English error string that is sent
+   * back to the LLM as a correction prompt.
+   *
+   * @param {object} action
+   * @param {object} pageState
+   * @returns {string|null}
+   */
+  _validateAction(action, pageState) {
+    if (!action || typeof action !== 'object' || Array.isArray(action)) {
+      return 'The "action" field is missing or not a JSON object. Provide exactly one action.';
+    }
 
-    // Prioritise in-viewport elements; cap total to avoid context overflow.
-    // Real pages (Facebook, Gmail) can have 300+ elements — each line is
-    // ~120 chars, so 300 elements = ~36 K tokens per message.
-    const MAX_VIEWPORT = 50;
-    const MAX_OFFSCREEN = 20;
-    const inView  = elements.filter(el => el.inViewport);
-    const offView = elements.filter(el => !el.inViewport);
-    const shown   = [...inView.slice(0, MAX_VIEWPORT), ...offView.slice(0, MAX_OFFSCREEN)];
-    const hidden  = elements.length - shown.length;
+    const entries = Object.entries(action);
+    if (entries.length === 0) {
+      return 'The "action" object is empty. Provide exactly one action key.';
+    }
+    if (entries.length > 1) {
+      return `The "action" object must have exactly one key, got: ${Object.keys(action).join(', ')}. Remove all but one.`;
+    }
 
-    const elLines = shown.map(el => {
-      const cx = Math.round(el.rect.x + el.rect.width / 2);
-      const cy = Math.round(el.rect.y + el.rect.height / 2);
-      const typeStr  = el.type ? `[${el.type}]` : '';
-      const rawLabel = el.label || el.placeholder || el.text || '';
-      const labelStr = rawLabel ? ` "${rawLabel.slice(0, 60)}"` : '';
-      const vpStr    = el.inViewport ? '\u2713' : '\u2717 offscreen';
-      return `[${el.id}] ${el.tag}${typeStr}${labelStr} (${cx},${cy}) ${vpStr}`;
-    }).join('\n');
+    const [name, params] = entries[0];
+    const INDEX_ACTIONS = new Set(['click', 'type', 'select_option', 'scroll_element']);
 
-    const hiddenNote = hidden > 0 ? `\n(+ ${hidden} more elements not shown)` : '';
+    if (INDEX_ACTIONS.has(name)) {
+      const index = params?.index;
+      if (typeof index !== 'number') {
+        return `Action "${name}" requires a numeric "index" parameter, got: ${JSON.stringify(index)}.`;
+      }
+      const validIndices = (pageState.elements || []).map(e => e.index);
+      if (!validIndices.includes(index)) {
+        const hint = validIndices.length > 0
+          ? `Valid indices are: [${validIndices.join(', ')}].`
+          : 'There are no interactive elements on this page.';
+        return (
+          `Element index ${index} does not exist in the current page. ` +
+          `${hint} ` +
+          `Only use indices shown between [brackets] in the browser state.`
+        );
+      }
+    }
 
-    // Only include the task line on the first iteration — no need to repeat it.
-    const taskLine = iteration === 0 ? `Task: ${task}\n\n` : '';
-    const continueNote = iteration > 0
-      ? '\nEvaluate the current state and continue the task or declare done.'
-      : '';
+    return null; // valid
+  }
 
-    return `${taskLine}Page: ${url} \u2014 "${title}"\nViewport ${viewportWidth}\u00d7${viewportHeight}, scroll (${sx},${sy})\n\nElements (${shown.length} shown, ${elements.length} total):\n${elLines || '(none)'}${hiddenNote}${continueNote}`;
+  systemPrompt() {
+    return `You are an AI agent that automates browser tasks in an iterative loop.
+
+══════════════════════════════════════════════════════════════
+INPUT — at every step you receive:
+══════════════════════════════════════════════════════════════
+<agent_state>    : the task and current step number
+<agent_history>  : summaries of previous steps (NOT the page — just your notes)
+<browser_state>  : current URL, page dimensions, interactive elements
+
+══════════════════════════════════════════════════════════════
+BROWSER STATE FORMAT
+══════════════════════════════════════════════════════════════
+Elements appear as:
+  [index]<tag attr=value>text</tag>
+  *[index]  = element that NEWLY appeared since the last step (pay attention)
+  \\t         = child of the element above (DOM hierarchy)
+  data-scrollable="top=0, bottom=340" = this element is scrollable, 340px below
+
+Only elements with [index] are interactive. Use ONLY those indices.
+Pure text lines without [index] are informational only.
+
+══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — MANDATORY, NO EXCEPTIONS
+══════════════════════════════════════════════════════════════
+Every response MUST be raw JSON. No prose, no markdown, no code fences.
+
+{
+  "evaluation_previous_goal": "One sentence: was your last action successful?",
+  "memory": "1-3 sentences: what have you done, what matters for the rest",
+  "next_goal": "One sentence: your immediate next goal",
+  "action": { "ACTION_NAME": { ...params } }
+}
+
+Exactly ONE action per response. The harness handles scroll, mouse movement,
+and timing automatically — you only say WHAT to do, not HOW.
+
+══════════════════════════════════════════════════════════════
+ACTIONS
+══════════════════════════════════════════════════════════════
+Click an element:
+  {"action": {"click": {"index": 5}}}
+
+Click and type text (clears existing content first):
+  {"action": {"type": {"index": 3, "text": "hello@example.com"}}}
+
+Select a dropdown option:
+  {"action": {"select_option": {"index": 7, "text": "United States"}}}
+
+Scroll the page:
+  {"action": {"scroll": {"direction": "down", "amount": "medium"}}}
+  direction: "up" | "down"
+  amount: "small" (200px) | "medium" (500px) | "large" (full page height)
+
+Scroll a specific scrollable element:
+  {"action": {"scroll_element": {"index": 4, "direction": "down", "amount": "medium"}}}
+
+Navigate to a URL:
+  {"action": {"navigate": {"url": "https://example.com"}}}
+
+Wait briefly:
+  {"action": {"wait": {"seconds": 2}}}
+
+Finish the task:
+  {"action": {"done": {"success": true, "message": "Completed: found 127 friends"}}}
+  {"action": {"done": {"success": false, "message": "Cannot proceed: CAPTCHA required"}}}
+
+══════════════════════════════════════════════════════════════
+RULES
+══════════════════════════════════════════════════════════════
+1. Only use indices shown in the current browser state.
+2. NEVER use an index that is not visible — scroll first if needed.
+3. If an element is new (*[index]), it probably appeared due to your last action — act on it.
+4. Click a field before typing into it — but use "type" action which handles this automatically.
+5. If a CAPTCHA appears, call done(success=false) with a clear explanation.
+6. Track progress in "memory" — the next step will not see the page as it was.
+7. If stuck (same state 2 steps in a row), try a different approach or scroll.
+8. Keep evaluation/memory/next_goal brief and factual.`;
   }
 }

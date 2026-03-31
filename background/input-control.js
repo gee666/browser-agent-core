@@ -50,12 +50,30 @@ export class InputControlBridge {
     });
   }
 
+  /**
+   * Estimate a reasonable timeout for a command.
+   * For 'type', derive it from text length + WPM so long prompts never time out.
+   * Everything else gets a flat 30 s.
+   */
+  _timeoutFor(command, params) {
+    if (command === 'type' && typeof params?.text === 'string') {
+      const wpm = params.wpm || 60;
+      const chars = params.text.length;
+      // ms to type the text at the given WPM (1 word ≈ 5 chars)
+      const typingMs = Math.ceil((chars / (wpm * 5)) * 60_000);
+      // add 10 s headroom for startup / inter-key jitter
+      return Math.max(30_000, typingMs + 10_000);
+    }
+    return 30_000;
+  }
+
   async execute(command, params, context) {
     if (!this._port) {
       await this.connect();
     }
 
     const id = crypto.randomUUID();
+    const timeoutMs = this._timeoutFor(command, params);
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -63,7 +81,7 @@ export class InputControlBridge {
           this._pending.delete(id);
           reject(new InputControlTimeoutError());
         }
-      }, 30_000);
+      }, timeoutMs);
 
       this._pending.set(id, { resolve, reject, timer });
 
