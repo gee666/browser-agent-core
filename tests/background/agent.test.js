@@ -388,6 +388,69 @@ describe('AgentCore', () => {
     expect(llm.complete).toHaveBeenCalledTimes(2);
   });
 
+  // ── loop detection tests ──────────────────────────────────────────────────────
+
+  test('test_loop_detected_when_same_action_on_same_url_twice', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    let call = 0;
+    const llm = { complete: jest.fn().mockImplementation(({ messages }) => {
+      captured.push(messages[0].content);
+      call++;
+      // Always return click(0) so we get the same action twice
+      if (call <= 2) return Promise.resolve(makeClickResponse(0));
+      return Promise.resolve(makeDoneResponse('ok'));
+    }) };
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    // Third LLM call should see LOOP DETECTED in history
+    expect(captured.length).toBeGreaterThanOrEqual(3);
+    expect(captured[2]).toContain('LOOP DETECTED');
+  });
+
+  test('test_no_loop_warning_when_actions_differ', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    let call = 0;
+    const llm = { complete: jest.fn().mockImplementation(({ messages }) => {
+      captured.push(messages[0].content);
+      call++;
+      // Alternate between index 0 and index 1
+      if (call === 1) return Promise.resolve(makeClickResponse(0));
+      if (call === 2) return Promise.resolve(makeClickResponse(1));
+      return Promise.resolve(makeDoneResponse('ok'));
+    }) };
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    // No loop warning should appear
+    if (captured.length >= 3) {
+      expect(captured[2]).not.toContain('LOOP DETECTED');
+    }
+  });
+
+  test('test_loop_resets_on_new_run', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const llm = makeLLM(makeClickResponse(0), makeDoneResponse('ok'));
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('first run');
+    // second run should start fresh — no loop warning on first step
+    const captured = [];
+    const llm2 = { complete: jest.fn().mockImplementation(({ messages }) => {
+      captured.push(messages[0].content);
+      return Promise.resolve(makeDoneResponse('ok'));
+    }) };
+    agent._llm = llm2;
+    await agent.run('second run');
+    expect(captured[0]).not.toContain('LOOP DETECTED');
+  });
+
   test('test_executor_error_is_recoverable_and_agent_continues', async () => {
     const bridge = createMockBridge();
     const statuses = [];

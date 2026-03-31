@@ -36,6 +36,9 @@ export class AgentCore {
     this._onStatus = onStatus;
     this._stopped = false;
     this._history = [];
+    // Loop detection: track last 5 (url, actionStr) pairs so we can spot
+    // identical actions being repeated on the same page with no progress.
+    this._recentActions = [];
   }
 
   /** Signal the running loop to stop after the current iteration. */
@@ -201,6 +204,26 @@ export class AgentCore {
         // Wait for any triggered navigation or DOM update to settle.
         const tabId2 = await this._bridge.getActiveTabId();
         await this._bridge.waitForPageSettle(tabId2, 1500);
+        // ── Loop detection ───────────────────────────────────────────────
+        // Track (url-before-action, serialised action) to spot repeated
+        // actions that produce no visible change (e.g. popup keeps opening).
+        const actionStr = JSON.stringify(action);
+        this._recentActions.push({ url: pageState.url, actionStr });
+        if (this._recentActions.length > 5) this._recentActions.shift();
+        const ra = this._recentActions;
+        const len = ra.length;
+        // Detect: last 2 entries are the same (url + action)
+        if (len >= 2 &&
+            ra[len - 1].url === ra[len - 2].url &&
+            ra[len - 1].actionStr === ra[len - 2].actionStr) {
+          histEntry.actionResult +=
+            '\n<sys>LOOP DETECTED: You just performed the exact same action on the ' +
+            'same page again with no apparent change. Do NOT repeat it. ' +
+            'Try a completely different approach: dismiss any popup first ' +
+            '(press Escape, or look for a close/× button with *[index]), ' +
+            'scroll to find new content, navigate to a different URL, or ' +
+            'click a different element entirely.</sys>';
+        }
       } catch (err) {
         if (err.name === 'ExecutorError') {
           // Recoverable: record the failure in history so the LLM can adapt
