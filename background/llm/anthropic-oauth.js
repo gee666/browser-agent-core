@@ -130,10 +130,12 @@ export class AnthropicOAuthProvider extends LLMProvider {
       messages: anthropicMessages,
     };
 
+    // Anthropic OAuth access tokens (sk-ant-oat01-...) are used as API keys,
+    // not as Bearer tokens. The Authorization header is not supported.
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${tokens.access}`,
+        'x-api-key': tokens.access,
         'anthropic-version': '2023-06-01',
         'Content-Type': 'application/json',
       },
