@@ -94,22 +94,25 @@ const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
  */
 function buildCodexBody(model, system, messages, screenshot) {
   const input = [];
+  const lastUserIdx = [...messages].map(m => m.role).lastIndexOf('user');
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    const role = msg.role === 'assistant' ? 'assistant' : 'user';
 
-    if (role === 'assistant') {
+    if (msg.role === 'assistant') {
+      // content is always a plain string from our history
       const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
       input.push({ role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] });
     } else {
+      // user message — content is always a plain string (screenshots are NOT stored in history)
       const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
       const parts = [{ type: 'input_text', text }];
 
-      // Attach screenshot to the last user message only
-      const isLastUser = i === messages.map(m => m.role).lastIndexOf('user');
-      if (isLastUser && screenshot) {
-        parts.push({ type: 'input_image', detail: 'auto', image_url: screenshot });
+      // Attach current screenshot only to the last user message
+      if (i === lastUserIdx && screenshot) {
+        // Strip the data-URL prefix — Codex wants the raw base64 PNG
+        const raw = screenshot.replace(/^data:image\/\w+;base64,/, '');
+        parts.push({ type: 'input_image', detail: 'auto', image_url: `data:image/png;base64,${raw}` });
       }
 
       input.push({ role: 'user', content: parts });

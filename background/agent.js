@@ -95,14 +95,15 @@ export class AgentCore {
       this._status({ state: 'thinking' });
 
       const userMsg = this.buildUserMessage(task, pageState, iteration, messageHistory);
-      const userContent = screenshot
-        ? [{ type: 'text', text: userMsg }, { type: 'image_url', image_url: { url: screenshot } }]
-        : userMsg;
 
-      messageHistory.push({ role: 'user', content: userContent });
+      // Store ONLY text in history — never store screenshots.
+      // Screenshots are large (1–3 MB base64) and accumulate fast.
+      // The current screenshot is passed separately to complete() so each
+      // provider can attach it only to the latest message.
+      messageHistory.push({ role: 'user', content: userMsg });
 
-      // Cap history at 10 pairs (20 messages)
-      const cappedHistory = messageHistory.slice(-20);
+      // Cap history at 6 pairs (12 messages) — pages have large element lists
+      const cappedHistory = messageHistory.slice(-12);
 
       // Call LLM, with one retry on JSON parse failure.
       let parsed = null;
@@ -111,7 +112,7 @@ export class AgentCore {
         raw = await this._llm.complete({
           system: this.systemPrompt(),
           messages: cappedHistory,
-          screenshot: null, // already embedded in last user message above
+          screenshot, // providers attach this only to the last user message
         });
         try {
           parsed = parseJSONFromText(raw);
@@ -225,22 +226,34 @@ STRICT RULES
     const sx = Math.round(context.scrollX || 0);
     const sy = Math.round(context.scrollY || 0);
 
-    const elLines = elements.map((el, i) => {
+    // Prioritise in-viewport elements; cap total to avoid context overflow.
+    // Real pages (Facebook, Gmail) can have 300+ elements — each line is
+    // ~120 chars, so 300 elements = ~36 K tokens per message.
+    const MAX_VIEWPORT = 50;
+    const MAX_OFFSCREEN = 20;
+    const inView  = elements.filter(el => el.inViewport);
+    const offView = elements.filter(el => !el.inViewport);
+    const shown   = [...inView.slice(0, MAX_VIEWPORT), ...offView.slice(0, MAX_OFFSCREEN)];
+    const hidden  = elements.length - shown.length;
+
+    const elLines = shown.map(el => {
       const cx = Math.round(el.rect.x + el.rect.width / 2);
       const cy = Math.round(el.rect.y + el.rect.height / 2);
-      const typeStr = el.type ? `[${el.type}]` : '';
-      const labelStr = el.label ? ` "${el.label}"` : '';
-      const phStr = el.placeholder ? ` placeholder="${el.placeholder}"` : '';
-      const vpStr = el.inViewport ? '\u2713 viewport' : '\u2717 not in viewport';
-      return `[${el.id}]  ${el.tag}${typeStr}${labelStr}${phStr}  at (${el.rect.x},${el.rect.y}) ${el.rect.width}\u00d7${el.rect.height}  center(${cx},${cy})  ${vpStr}`;
+      const typeStr  = el.type ? `[${el.type}]` : '';
+      const rawLabel = el.label || el.placeholder || el.text || '';
+      const labelStr = rawLabel ? ` "${rawLabel.slice(0, 60)}"` : '';
+      const vpStr    = el.inViewport ? '\u2713' : '\u2717 offscreen';
+      return `[${el.id}] ${el.tag}${typeStr}${labelStr} (${cx},${cy}) ${vpStr}`;
     }).join('\n');
 
-    let msg = `Task: ${task}\n\nCurrent page: ${url} \u2014 "${title}"\n\nInteractive elements (${elements.length} total, viewport ${viewportWidth}\u00d7${viewportHeight}, scroll ${sx},${sy}):\n${elLines || '(none)'}`;
+    const hiddenNote = hidden > 0 ? `\n(+ ${hidden} more elements not shown)` : '';
 
-    if (iteration > 0) {
-      msg += '\n\nPrevious actions have been performed. Evaluate current state and continue or declare done.';
-    }
+    // Only include the task line on the first iteration — no need to repeat it.
+    const taskLine = iteration === 0 ? `Task: ${task}\n\n` : '';
+    const continueNote = iteration > 0
+      ? '\nEvaluate the current state and continue the task or declare done.'
+      : '';
 
-    return msg;
+    return `${taskLine}Page: ${url} \u2014 "${title}"\nViewport ${viewportWidth}\u00d7${viewportHeight}, scroll (${sx},${sy})\n\nElements (${shown.length} shown, ${elements.length} total):\n${elLines || '(none)'}${hiddenNote}${continueNote}`;
   }
 }
