@@ -133,6 +133,44 @@ export class BrowserBridge {
   }
 
   /**
+   * Focus the element with the given extractor index via the content script.
+   * Uses el.focus() on the real DOM node, which is more reliable than relying
+   * on a native click transferring keyboard focus (timing-sensitive).
+   * @param {number} tabId
+   * @param {number} index
+   * @returns {Promise<boolean>}
+   */
+  async focusElement(tabId, index) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 2000);
+      chrome.tabs.sendMessage(tabId, { type: 'focus_element', index }, (response) => {
+        clearTimeout(timer);
+        void chrome.runtime.lastError;
+        resolve(response?.ok === true);
+      });
+    });
+  }
+
+  /**
+   * Read back the current value of an element via the content script.
+   * For inputs/textareas returns .value; for contenteditable returns .textContent.
+   * Returns null if the element cannot be found or the message times out.
+   * @param {number} tabId
+   * @param {number} index
+   * @returns {Promise<string|null>}
+   */
+  async getElementValue(tabId, index) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), 2000);
+      chrome.tabs.sendMessage(tabId, { type: 'get_element_value', index }, (response) => {
+        clearTimeout(timer);
+        void chrome.runtime.lastError;
+        resolve(response?.ok ? (response.value ?? '') : null);
+      });
+    });
+  }
+
+  /**
    * Scroll the element with the given extractor index into the viewport by calling
    * element.scrollIntoView() on the real DOM node inside the content script.
    *

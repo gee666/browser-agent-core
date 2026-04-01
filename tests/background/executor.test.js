@@ -37,6 +37,8 @@ beforeEach(() => {
     getPageState:       jest.fn().mockResolvedValue(defaultPageState),
     scrollToPosition:         jest.fn().mockResolvedValue(undefined),
     scrollElementIntoView:    jest.fn().mockResolvedValue(true),
+    focusElement:             jest.fn().mockResolvedValue(true),
+    getElementValue:          jest.fn().mockResolvedValue('hello'), // default: matches typed text
   };
   mockInputControl = { execute: jest.fn().mockResolvedValue(undefined) };
 
@@ -222,6 +224,79 @@ describe('ActionExecutor v2', () => {
     const result = await executor.execute({ done: { success: true, message: 'ok' } }, defaultPageState);
     expect(result).toEqual({ done: true, success: true, message: 'ok' });
     expect(mockInputControl.execute).not.toHaveBeenCalled();
+  });
+
+  // _executeType: focusElement is called between click and Ctrl+A
+  test('test_type_calls_focusElement_before_shortcut', async () => {
+    mockBridge.getElementValue.mockResolvedValue('hello');
+    const executor = makeExecutor();
+    await executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState);
+    // focusElement must be called
+    expect(mockBridge.focusElement).toHaveBeenCalledWith(1, 0);
+    // and it must happen before the Ctrl+A shortcut
+    const focusOrder   = mockBridge.focusElement.mock.invocationCallOrder[0];
+    const shortcutCall = mockInputControl.execute.mock.calls.findIndex(c => c[0] === 'press_shortcut');
+    const shortcutOrder= mockInputControl.execute.mock.invocationCallOrder[shortcutCall];
+    expect(focusOrder).toBeLessThan(shortcutOrder);
+  });
+
+  // _executeType: success on first attempt when value matches
+  test('test_type_succeeds_when_value_matches', async () => {
+    mockBridge.getElementValue.mockResolvedValue('hello');
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
+      .resolves.not.toThrow();
+    // Only one call to 'type' (no retry)
+    const typeCalls = mockInputControl.execute.mock.calls.filter(c => c[0] === 'type');
+    expect(typeCalls).toHaveLength(1);
+  });
+
+  // _executeType: retries once when first attempt value is empty
+  test('test_type_retries_when_value_empty', async () => {
+    // First verification returns empty, second returns correct value
+    mockBridge.getElementValue
+      .mockResolvedValueOnce('')
+      .mockResolvedValue('hello');
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
+      .resolves.not.toThrow();
+    // Two 'type' calls (original + retry)
+    const typeCalls = mockInputControl.execute.mock.calls.filter(c => c[0] === 'type');
+    expect(typeCalls).toHaveLength(2);
+  });
+
+  // _executeType: throws ExecutorError after all attempts fail
+  test('test_type_throws_after_all_attempts_fail', async () => {
+    mockBridge.getElementValue.mockResolvedValue(''); // always empty
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
+      .rejects.toThrow(ExecutorError);
+  });
+
+  // _typeSucceeded: null value is treated as success (unreadable rich-text editor)
+  test('test_typeSucceeded_null_is_success', () => {
+    const executor = makeExecutor();
+    expect(executor._typeSucceeded(null, 'anything')).toBe(true);
+  });
+
+  // _typeSucceeded: exact match
+  test('test_typeSucceeded_exact_match', () => {
+    const executor = makeExecutor();
+    expect(executor._typeSucceeded('hello', 'hello')).toBe(true);
+  });
+
+  // _typeSucceeded: empty actual is failure
+  test('test_typeSucceeded_empty_is_failure', () => {
+    const executor = makeExecutor();
+    expect(executor._typeSucceeded('', 'hello')).toBe(false);
+  });
+
+  // _typeSucceeded: long text partial match (first 50 chars match, >=80% length)
+  test('test_typeSucceeded_partial_long_text', () => {
+    const executor = makeExecutor();
+    const expected = 'A'.repeat(200);
+    const actual   = 'A'.repeat(170); // 85% ≥ 80%
+    expect(executor._typeSucceeded(actual, expected)).toBe(true);
   });
 
   // 10. unknown action name throws ExecutorError

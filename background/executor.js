@@ -59,13 +59,85 @@ export class ActionExecutor {
   }
 
   async _executeType(index, text, pageState) {
-    await this._executeClick(index, pageState);
-    await this._sleep(150);
-    await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, pageState.context);
-    await this._sleep(80);
-    await this._inputControl.execute('press_key', { key: 'Delete' }, pageState.context);
-    await this._sleep(80);
-    await this._inputControl.execute('type', { text, wpm: 55 + this._rand(0, 15) }, pageState.context);
+    const tabId = await this._bridge.getActiveTabId();
+    const MAX_TYPE_ATTEMPTS = 2;
+
+    for (let attempt = 0; attempt < MAX_TYPE_ATTEMPTS; attempt++) {
+      // Re-fetch state on retry so we have fresh coords and context.
+      if (attempt > 0) {
+        await this._sleep(300);
+        pageState = await this._bridge.getPageState(tabId);
+      }
+
+      const { x, y, pageState: freshState } = await this._getValidatedCoords(index, pageState);
+      const ctx = freshState.context;
+
+      // 1. Native click to position the cursor.
+      await this._inputControl.execute('mouse_move', { x, y, duration_ms: 350 + this._rand(0, 150) }, ctx);
+      await this._sleep(80 + this._rand(0, 60));
+      await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1 }, ctx);
+      await this._sleep(150);
+
+      // 2. Force DOM focus via the content script.
+      //    A native click does not always transfer keyboard focus before the next
+      //    keystroke arrives (race between the OS input queue and Chrome's focus
+      //    handling).  el.focus() is synchronous inside the page so it is
+      //    guaranteed to be in effect before we send Ctrl+A.
+      await this._bridge.focusElement(tabId, index);
+      await this._sleep(100);
+
+      // 3. Select all existing content inside the element and delete it.
+      await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, ctx);
+      await this._sleep(80);
+      await this._inputControl.execute('press_key', { key: 'Delete' }, ctx);
+      await this._sleep(80);
+
+      // 4. Type the new text.
+      await this._inputControl.execute('type', { text, wpm: 55 + this._rand(0, 15) }, ctx);
+      await this._sleep(200);
+
+      // 5. Verify: read back the element value and compare to what was typed.
+      const actual = await this._bridge.getElementValue(tabId, index);
+      if (this._typeSucceeded(actual, text)) return; // ✓
+
+      // Verification failed on this attempt — log and retry if we have attempts left.
+      if (attempt < MAX_TYPE_ATTEMPTS - 1) continue;
+
+      // All attempts exhausted — surface a clear ExecutorError so the agent
+      // records it in history and lets the LLM decide what to do next.
+      const got  = actual == null ? '(could not read field)' : `"${String(actual).slice(0, 60)}${actual.length > 60 ? '...' : ''}"`;
+      const want = `"${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`;
+      throw new ExecutorError(
+        `Text input verification failed after ${MAX_TYPE_ATTEMPTS} attempts: ` +
+        `expected ${want} but field contains ${got}. ` +
+        `The field may need a different interaction (direct click, special key, etc.).`,
+      );
+    }
+  }
+
+  /**
+   * Returns true when the text we read back from the element is a close-enough
+   * match to what we typed.
+   *
+   * Exact equality is ideal, but real pages may trim whitespace, apply
+   * max-length limits, or run through autocomplete — so we also accept:
+   *   • The field value starts with the first 50 chars of the expected text, AND
+   *   • At least 80 % of the expected length was accepted.
+   *
+   * If we could not read the value at all (null) we optimistically assume
+   * success rather than retrying blindly (e.g. rich-text editors that hide
+   * the value from DOM inspection).
+   */
+  _typeSucceeded(actual, expected) {
+    if (actual === null) return true; // can't read — assume ok
+    const a = String(actual).trim();
+    const e = expected.trim();
+    if (a === e) return true;
+    const checkLen = Math.min(e.length, 50);
+    return (
+      a.slice(0, checkLen) === e.slice(0, checkLen) &&
+      a.length >= Math.floor(e.length * 0.8)
+    );
   }
 
   async _executeScroll(direction, amount, pageState) {

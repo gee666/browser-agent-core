@@ -332,6 +332,36 @@
       }
       return true;
     }
+    if (message.type === 'focus_element') {
+      var fel = indexToElement.get(message.index);
+      if (fel && fel.isConnected) {
+        fel.focus({ preventScroll: true });
+        // For contenteditable, also move the caret to the end so Ctrl+A
+        // selects the element's own content, not the whole page.
+        if (fel.isContentEditable) {
+          var range = document.createRange();
+          range.selectNodeContents(fel);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        sendResponse({ ok: true });
+      } else {
+        sendResponse({ ok: false, reason: 'element not found or disconnected' });
+      }
+      return true;
+    }
+    if (message.type === 'get_element_value') {
+      var vel = indexToElement.get(message.index);
+      if (!vel || !vel.isConnected) {
+        sendResponse({ ok: false, value: null, reason: 'not found' });
+      } else {
+        // inputs and textareas expose .value; contenteditable and others use textContent
+        var val = ('value' in vel) ? vel.value : (vel.textContent || vel.innerText || '');
+        sendResponse({ ok: true, value: val });
+      }
+      return true;
+    }
   });
 
 })();
