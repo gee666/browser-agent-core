@@ -224,7 +224,7 @@
             ', left=' + si.left + ', right=' + si.right + '"';
         }
 
-        var prefix = el.isNew ? '*' : '';
+        var prefix = '';
         str += indent + prefix + '[' + el.index + ']<' + el.tag + attrsStr + '>' + el.text + '</' + el.tag + '>\n';
       }
     }

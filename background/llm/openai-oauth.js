@@ -111,8 +111,10 @@ function buildCodexBody(model, system, messages, screenshot) {
       // Attach current screenshot only to the last user message
       if (i === lastUserIdx && screenshot) {
         // Strip the data-URL prefix — Codex wants the raw base64 PNG
-        const raw = screenshot.replace(/^data:image\/\w+;base64,/, '');
-        parts.push({ type: 'input_image', detail: 'auto', image_url: `data:image/png;base64,${raw}` });
+        const _mimeMatch = screenshot.match(/^data:(image\/[^;]+);base64,/);
+        const _mimeType = _mimeMatch ? _mimeMatch[1] : 'image/png';
+        const raw = screenshot.replace(/^data:image\/[^;]+;base64,/, '');
+        parts.push({ type: 'input_image', detail: 'auto', image_url: `data:${_mimeType};base64,${raw}` });
       }
 
       input.push({ role: 'user', content: parts });

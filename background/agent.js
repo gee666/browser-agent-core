@@ -36,7 +36,7 @@ export class AgentCore {
     this._onStatus = onStatus;
     this._stopped = false;
     this._history = [];
-    // Loop detection: track last 5 (url, actionStr) pairs so we can spot
+    // Loop detection: track last 6 (url, actionStr) pairs so we can spot
     // identical actions being repeated on the same page with no progress.
     this._recentActions = [];
   }
@@ -102,7 +102,7 @@ export class AgentCore {
 
       let screenshot = null;
       if (this._useVision) {
-        screenshot = await this._bridge.takeScreenshot();
+        screenshot = await this._compressScreenshot(await this._bridge.takeScreenshot());
       }
 
       this._status({ state: 'thinking' });
@@ -188,8 +188,22 @@ export class AgentCore {
       const action = parsed.action || {};
 
       if (action.done) {
-        this._status({ state: 'done', message: action.done.message ?? null });
-        return action.done.message ?? null;
+        // Take a fresh screenshot for verification (if vision enabled)
+        let verifyShot = null;
+        if (this._useVision) {
+          verifyShot = await this._compressScreenshot(await this._bridge.takeScreenshot());
+        }
+        const verifyResult = await this._verifyDone(task, action.done, pageState, verifyShot);
+        if (verifyResult.verified) {
+          this._status({ state: 'done', message: verifyResult.message });
+          return verifyResult.message;
+        }
+        // Verification failed — record why and continue
+        histEntry.actionResult =
+          `Done was declared but verification shows the task is not complete yet: ` +
+          `${verifyResult.reason}. Please continue working on the task.`;
+        await this._sleep(1500);
+        continue;
       }
 
       this._status({ state: 'acting', actionsCount: 1 });
@@ -205,24 +219,18 @@ export class AgentCore {
         const tabId2 = await this._bridge.getActiveTabId();
         await this._bridge.waitForPageSettle(tabId2, 1500);
         // ── Loop detection ───────────────────────────────────────────────
-        // Track (url-before-action, serialised action) to spot repeated
-        // actions that produce no visible change (e.g. popup keeps opening).
+        // Track (url, serialised-action) pairs to spot cycles of length 1, 2, or 3.
         const actionStr = JSON.stringify(action);
         this._recentActions.push({ url: pageState.url, actionStr });
-        if (this._recentActions.length > 5) this._recentActions.shift();
-        const ra = this._recentActions;
-        const len = ra.length;
-        // Detect: last 2 entries are the same (url + action)
-        if (len >= 2 &&
-            ra[len - 1].url === ra[len - 2].url &&
-            ra[len - 1].actionStr === ra[len - 2].actionStr) {
+        if (this._recentActions.length > 6) this._recentActions.shift();
+        const loopLen = this._detectLoop();
+        if (loopLen > 0) {
           histEntry.actionResult +=
-            '\n<sys>LOOP DETECTED: You just performed the exact same action on the ' +
-            'same page again with no apparent change. Do NOT repeat it. ' +
-            'Try a completely different approach: dismiss any popup first ' +
-            '(press Escape, or look for a close/× button with *[index]), ' +
-            'scroll to find new content, navigate to a different URL, or ' +
-            'click a different element entirely.</sys>';
+            `\n<sys>LOOP DETECTED (cycle of ${loopLen} action(s)): You are repeating ` +
+            `the same sequence of actions with no progress. Do NOT repeat them. ` +
+            `Try a completely different approach: scroll to reveal new content, ` +
+            `navigate to a different URL, interact with a different element, ` +
+            `or — if a popup or overlay is blocking — try dismissing it first.</sys>`;
         }
       } catch (err) {
         if (err.name === 'ExecutorError') {
@@ -337,6 +345,132 @@ export class AgentCore {
     return null; // valid
   }
 
+  /**
+   * Detect repeating action cycles of length 1, 2, or 3.
+   * Returns the cycle length detected (1, 2, or 3), or 0 if no loop.
+   */
+  _detectLoop() {
+    const ra = this._recentActions;
+    const len = ra.length;
+    const eq = (a, b) => a.url === b.url && a.actionStr === b.actionStr;
+
+    // Cycle 1: same action twice in a row
+    if (len >= 2 && eq(ra[len - 1], ra[len - 2])) return 1;
+
+    // Cycle 2: ABAB pattern
+    if (len >= 4 &&
+        eq(ra[len - 1], ra[len - 3]) &&
+        eq(ra[len - 2], ra[len - 4])) return 2;
+
+    // Cycle 3: ABCABC pattern
+    if (len >= 6 &&
+        eq(ra[len - 1], ra[len - 4]) &&
+        eq(ra[len - 2], ra[len - 5]) &&
+        eq(ra[len - 3], ra[len - 6])) return 3;
+
+    return 0;
+  }
+
+  /**
+   * Verify that the task was truly completed after the LLM declared done.
+   * Sends the current page state (and optional screenshot) to the LLM for
+   * a confirmation check.
+   *
+   * @param {string} task
+   * @param {object} doneAction  - the done action object from the LLM
+   * @param {object} pageState   - current page state at time of done declaration
+   * @param {string|null} screenshot - compressed screenshot (or null)
+   * @returns {Promise<{verified:boolean, message:string, reason:string}>}
+   */
+  async _verifyDone(task, doneAction, pageState, screenshot) {
+    const doneMsg = doneAction.message ?? '';
+
+    const verifyPrompt =
+      `Original task: "${task}"\n\n` +
+      `The agent declared completion with: "${doneMsg}"\n\n` +
+      `Current page URL: ${pageState.url}\n` +
+      `Current page content:\n${pageState.domText || '(empty)'}\n\n` +
+      `Looking at the current page state${
+        screenshot ? ' and screenshot' : ''
+      }, was the task truly and fully completed?\n\n` +
+      `Reply ONLY with raw JSON — no prose, no markdown:\n` +
+      `  {"verified": true, "message": "one-line success summary"}\n` +
+      `  OR\n` +
+      `  {"verified": false, "reason": "what is still missing or needs to be done"}`;
+
+    let raw;
+    try {
+      raw = await this._llm.complete({
+        system:
+          'You are a task verification assistant for a browser automation agent. ' +
+          'Examine the current browser state and confirm whether the task was completed. ' +
+          'Reply ONLY with raw JSON: {"verified": true/false, "message": "...", "reason": "..."}',
+        messages: [{ role: 'user', content: verifyPrompt }],
+        screenshot,
+      });
+    } catch (_) {
+      // If the verification call itself fails, assume success to avoid breaking flow
+      return { verified: true, message: doneMsg, reason: '' };
+    }
+
+    try {
+      const parsed = parseJSONFromText(raw);
+      if (parsed.verified === true) {
+        return { verified: true, message: parsed.message || doneMsg, reason: '' };
+      }
+      return {
+        verified: false,
+        message: doneMsg,
+        reason: parsed.reason || 'Verification did not confirm task completion',
+      };
+    } catch (_) {
+      // Parse failure — assume verified
+      return { verified: true, message: doneMsg, reason: '' };
+    }
+  }
+
+  /**
+   * Compress a PNG screenshot data URL into a smaller JPEG using OffscreenCanvas.
+   * Scales down to max 1280px wide and encodes at 70% JPEG quality.
+   * Falls back to the original data URL if compression fails.
+   *
+   * @param {string|null} dataUrl
+   * @returns {Promise<string|null>}
+   */
+  async _compressScreenshot(dataUrl) {
+    if (!dataUrl) return null;
+    try {
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const bitmap = await createImageBitmap(blob);
+
+      const maxWidth = 1280;
+      const scale = Math.min(1, maxWidth / bitmap.width);
+      const w = Math.round(bitmap.width * scale);
+      const h = Math.round(bitmap.height * scale);
+
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+
+      const jpegBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.7 });
+
+      // Convert to base64 data URL (FileReader not available in service workers)
+      const buf = await jpegBlob.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = '';
+      const chunk = 8192;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+      }
+      return `data:image/jpeg;base64,${btoa(binary)}`;
+    } catch (e) {
+      console.warn('[AgentCore] Screenshot compression failed, using original:', e);
+      return dataUrl;
+    }
+  }
+
   systemPrompt() {
     return `You are an AI agent that automates browser tasks in an iterative loop.
 
@@ -352,7 +486,6 @@ BROWSER STATE FORMAT
 ══════════════════════════════════════════════════════════════
 Elements appear as:
   [index]<tag attr=value>text</tag>
-  *[index]  = element that NEWLY appeared since the last step (pay attention)
   \\t         = child of the element above (DOM hierarchy)
   data-scrollable="top=0, bottom=340" = this element is scrollable, 340px below
 
@@ -409,7 +542,7 @@ RULES
 ══════════════════════════════════════════════════════════════
 1. Only use indices shown in the current browser state.
 2. NEVER use an index that is not visible — scroll first if needed.
-3. If an element is new (*[index]), it probably appeared due to your last action — act on it.
+3. After an action, new elements may appear — check the updated browser state and act on them.
 4. Click a field before typing into it — but use "type" action which handles this automatically.
 5. If a CAPTCHA appears, call done(success=false) with a clear explanation.
 6. Track progress in "memory" — the next step will not see the page as it was.

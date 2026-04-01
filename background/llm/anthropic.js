@@ -22,7 +22,9 @@ export class AnthropicProvider extends LLMProvider {
       const isLast = index === messages.length - 1;
       if (isLast && msg.role === 'user' && screenshot) {
         // Strip data URL prefix to get raw base64
-        const base64Data = screenshot.replace(/^data:image\/png;base64,/, '');
+        const _mimeMatch = screenshot.match(/^data:(image\/[^;]+);base64,/);
+        const _mediaType = _mimeMatch ? _mimeMatch[1] : 'image/png';
+        const base64Data = screenshot.replace(/^data:image\/[^;]+;base64,/, '');
         return {
           role: msg.role,
           content: [
@@ -30,7 +32,7 @@ export class AnthropicProvider extends LLMProvider {
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: 'image/png',
+                media_type: _mediaType,
                 data: base64Data,
               },
             },

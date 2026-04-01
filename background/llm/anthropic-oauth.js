@@ -108,7 +108,9 @@ export class AnthropicOAuthProvider extends LLMProvider {
     if (screenshot) {
       const lastUserIdx = anthropicMessages.map(m => m.role).lastIndexOf('user');
       if (lastUserIdx !== -1) {
-        const rawBase64 = screenshot.replace(/^data:image\/png;base64,/, '');
+        const _mimeMatch = screenshot.match(/^data:(image\/[^;]+);base64,/);
+        const _mediaType = _mimeMatch ? _mimeMatch[1] : 'image/png';
+        const rawBase64 = screenshot.replace(/^data:image\/[^;]+;base64,/, '');
         const textContent = typeof anthropicMessages[lastUserIdx].content === 'string'
           ? anthropicMessages[lastUserIdx].content
           : JSON.stringify(anthropicMessages[lastUserIdx].content);
@@ -116,7 +118,7 @@ export class AnthropicOAuthProvider extends LLMProvider {
           role: 'user',
           content: [
             { type: 'text', text: textContent },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: rawBase64 } },
+            { type: 'image', source: { type: 'base64', media_type: _mediaType, data: rawBase64 } },
           ],
         };
       }

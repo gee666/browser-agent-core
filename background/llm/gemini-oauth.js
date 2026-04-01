@@ -196,12 +196,14 @@ export class GeminiOAuthProvider extends LLMProvider {
       // Add screenshot to last user message
       const isLastUser = msg.role === 'user' && idx === messages.map(m => m.role).lastIndexOf('user');
       if (isLastUser && screenshot) {
-        const rawBase64 = screenshot.replace(/^data:image\/png;base64,/, '');
+        const _mimeMatch = screenshot.match(/^data:(image\/[^;]+);base64,/);
+        const _mimeType = _mimeMatch ? _mimeMatch[1] : 'image/png';
+        const rawBase64 = screenshot.replace(/^data:image\/[^;]+;base64,/, '');
         return {
           role,
           parts: [
             { text },
-            { inlineData: { mimeType: 'image/png', data: rawBase64 } },
+            { inlineData: { mimeType: _mimeType, data: rawBase64 } },
           ],
         };
       }
