@@ -78,15 +78,7 @@ export class ActionExecutor {
       await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1 }, ctx);
       await this._sleep(150);
 
-      // 2. Force DOM focus via the content script.
-      //    A native click does not always transfer keyboard focus before the next
-      //    keystroke arrives (race between the OS input queue and Chrome's focus
-      //    handling).  el.focus() is synchronous inside the page so it is
-      //    guaranteed to be in effect before we send Ctrl+A.
-      await this._bridge.focusElement(tabId, index);
-      await this._sleep(100);
-
-      // 3. Select all existing content inside the element and delete it.
+      // 2. Select all existing content inside the element and delete it.
       await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, ctx);
       await this._sleep(80);
       await this._inputControl.execute('press_key', { key: 'Delete' }, ctx);
@@ -187,8 +179,8 @@ export class ActionExecutor {
   /**
    * Resolves and validates coordinates for an element.
    *
-   * If the element is outside the viewport, scrolls to it (via window.scrollTo —
-   * pixel-perfect, unlike a wheel event), re-fetches the page state, and retries
+   * If the element is outside the viewport, scrolls to it via python-input-control,
+   * re-fetches the page state, and retries
    * up to MAX_SCROLL_ATTEMPTS times.
    *
    * After all scroll attempts, validates that the final coordinates lie inside
@@ -222,7 +214,7 @@ export class ActionExecutor {
     const MAX_SCROLL_ATTEMPTS = 3;
 
     for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS && !el.inViewport; attempt++) {
-      await this._scrollToElement(el, pageState, tabId);
+      await this._scrollToElement(el, pageState);
       await this._sleep(600);
       const newState = await this._bridge.getPageState(tabId);
       const newEl = newState.elements.find(e => e.index === index);
@@ -257,25 +249,21 @@ export class ActionExecutor {
   }
 
   /**
-   * Scrolls the element into the viewport.
-   *
-   * Primary: calls element.scrollIntoView() on the real DOM node via the content
-   * script message. This handles nested scroll containers, sticky ancestors and
-   * pages that override window.scrollTo.
-   *
-   * Fallback: if the content-script path fails (e.g. element not yet in
-   * indexToElement map), falls back to window.scrollTo with calculated coords.
+   * Scrolls the element into the viewport using python-input-control scroll.
+   * Calculates the pixel delta needed to centre the element vertically and
+   * issues a native scroll event — no browser JS involved.
    */
-  async _scrollToElement(el, pageState, tabId) {
-    const ok = await this._bridge.scrollElementIntoView(tabId, el.index);
-    if (!ok) {
-      // Fallback: pixel-exact window scroll
-      const absX = (pageState.scrollX || 0) + el.rect.x + el.rect.w / 2;
-      const absY = (pageState.scrollY || 0) + el.rect.y + el.rect.h / 2;
-      const targetScrollX = Math.max(0, absX - pageState.viewportWidth  / 2);
-      const targetScrollY = Math.max(0, absY - pageState.viewportHeight / 2);
-      await this._bridge.scrollToPosition(tabId, targetScrollX, targetScrollY);
-    }
+  async _scrollToElement(el, pageState) {
+    const elementCenterY = el.rect.y + el.rect.h / 2;
+    const viewportCenterY = pageState.viewportHeight / 2;
+    const delta = Math.round(elementCenterY - viewportCenterY);
+    await this._inputControl.execute('scroll', {
+      x: Math.round(pageState.viewportWidth / 2),
+      y: Math.round(pageState.viewportHeight / 2),
+      delta_x: 0,
+      delta_y: delta,
+      duration_ms: 300,
+    }, pageState.context);
   }
 
   /**

@@ -78,22 +78,14 @@ export class BrowserBridge {
     // Get active tab id first so we have it for the navigation listener
     const activeTabId = await this.getActiveTabId();
 
-    await new Promise((resolve, reject) => {
-      chrome.tabs.update(activeTabId, { url }, (updatedTab) => {
-        if (chrome.runtime.lastError) {
-          return reject(new BridgeError(chrome.runtime.lastError.message));
-        }
-        resolve(updatedTab);
-      });
-    });
-
-    const tabId = activeTabId;
-
+    // Register the onCompleted listener BEFORE initiating navigation to avoid
+    // a race condition where fast/cached pages fire the event before the
+    // listener is attached, causing the promise to never resolve (timeout).
     await new Promise((resolve, reject) => {
       let timer;
 
       const listener = (details) => {
-        if (details.tabId !== tabId || details.frameId !== 0) return;
+        if (details.tabId !== activeTabId || details.frameId !== 0) return;
         clearTimeout(timer);
         chrome.webNavigation.onCompleted.removeListener(listener);
         resolve();
@@ -105,6 +97,15 @@ export class BrowserBridge {
       }, timeoutMs);
 
       chrome.webNavigation.onCompleted.addListener(listener);
+
+      // Start navigation only after the listener is in place
+      chrome.tabs.update(activeTabId, { url }, () => {
+        if (chrome.runtime.lastError) {
+          clearTimeout(timer);
+          chrome.webNavigation.onCompleted.removeListener(listener);
+          reject(new BridgeError(chrome.runtime.lastError.message));
+        }
+      });
     });
 
     // Additional settle delay
@@ -133,25 +134,6 @@ export class BrowserBridge {
   }
 
   /**
-   * Focus the element with the given extractor index via the content script.
-   * Uses el.focus() on the real DOM node, which is more reliable than relying
-   * on a native click transferring keyboard focus (timing-sensitive).
-   * @param {number} tabId
-   * @param {number} index
-   * @returns {Promise<boolean>}
-   */
-  async focusElement(tabId, index) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), 2000);
-      chrome.tabs.sendMessage(tabId, { type: 'focus_element', index }, (response) => {
-        clearTimeout(timer);
-        void chrome.runtime.lastError;
-        resolve(response?.ok === true);
-      });
-    });
-  }
-
-  /**
    * Read back the current value of an element via the content script.
    * For inputs/textareas returns .value; for contenteditable returns .textContent.
    * Returns null if the element cannot be found or the message times out.
@@ -167,54 +149,6 @@ export class BrowserBridge {
         void chrome.runtime.lastError;
         resolve(response?.ok ? (response.value ?? '') : null);
       });
-    });
-  }
-
-  /**
-   * Scroll the element with the given extractor index into the viewport by calling
-   * element.scrollIntoView() on the real DOM node inside the content script.
-   *
-   * This is the most reliable scroll method: it works with nested scroll containers,
-   * fixed/sticky ancestors, and pages that override window.scrollTo.
-   *
-   * @param {number} tabId
-   * @param {number} index  - extractor element index
-   * @returns {Promise<boolean>} true if the element was found and scrolled
-   */
-  async scrollElementIntoView(tabId, index) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), 3000);
-      chrome.tabs.sendMessage(tabId, { type: 'scroll_to_index', index }, (response) => {
-        clearTimeout(timer);
-        void chrome.runtime.lastError; // suppress unchecked error
-        resolve(response?.ok === true);
-      });
-    });
-  }
-
-  /**
-   * Scroll the tab to an absolute page position using window.scrollTo (pixel-perfect).
-   * This is used by the executor to bring elements into the viewport before clicking.
-   * Unlike native wheel events, this scrolls the exact number of pixels requested.
-   * @param {number} tabId
-   * @param {number} scrollX  - target window.scrollX
-   * @param {number} scrollY  - target window.scrollY
-   */
-  async scrollToPosition(tabId, scrollX, scrollY) {
-    return new Promise((resolve, reject) => {
-      chrome.scripting.executeScript(
-        {
-          target: { tabId },
-          func: (sx, sy) => window.scrollTo({ left: sx, top: sy, behavior: 'instant' }),
-          args: [Math.max(0, Math.round(scrollX)), Math.max(0, Math.round(scrollY))],
-        },
-        () => {
-          if (chrome.runtime.lastError) {
-            return reject(new BridgeError(chrome.runtime.lastError.message));
-          }
-          resolve();
-        },
-      );
     });
   }
 
