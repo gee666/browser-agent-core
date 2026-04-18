@@ -4,7 +4,7 @@
   var SKIP_TAGS = ['SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'HEAD'];
 
   var INTERACTIVE_CURSORS = [
-    'pointer', 'text', 'crosshair', 'grab', 'grabbing', 'cell', 'copy', 'move',
+    'pointer', 'crosshair', 'grab', 'grabbing', 'cell', 'copy', 'move',
     'e-resize', 'n-resize', 's-resize', 'w-resize',
     'ne-resize', 'nw-resize', 'se-resize', 'sw-resize',
   ];
@@ -114,14 +114,11 @@
     var isNew = !seenElements.has(el);
     var scrollInfo = getScrollInfo(el);
 
-    // Direct text from TEXT_NODE children only
-    var text = '';
-    for (var i = 0; i < el.childNodes.length; i++) {
-      if (el.childNodes[i].nodeType === 3) {
-        text += el.childNodes[i].textContent;
-      }
-    }
-    text = text.trim().slice(0, 80);
+    // Capture full visible text of the element (including text inside child
+    // spans/divs).  innerText respects CSS visibility and skips SVG/script
+    // nodes; fall back to textContent when innerText is unavailable (jsdom).
+    var rawText = (typeof el.innerText === 'string' ? el.innerText : el.textContent) || '';
+    var text = rawText.replace(/\s+/g, ' ').trim().slice(0, 80);
 
     // Collect HTML attributes
     var attrs = {};
@@ -167,13 +164,13 @@
       var info = buildElementInfo(el, depth, state.nextIndex++);
       state.elements.push(info);
       state.lines.push({ type: 'element', depth: depth, element: info });
-      // Recurse into children at depth+1; skip text nodes (already in .text)
-      for (var i = 0; i < el.childNodes.length; i++) {
-        var child = el.childNodes[i];
-        if (child.nodeType === 1) {
-          processElement(child, depth + 1, state);
-        }
-      }
+      // Do NOT recurse into children of interactive elements.
+      // Inner <span>/<svg>/icon nodes are visual decoration for the same
+      // clickable unit; giving them separate indices doubles the index count
+      // and makes the representation unreadable (especially on React SPAs
+      // like Suno where every button wraps its label in a <span> that
+      // inherits cursor:pointer and would otherwise get its own index).
+      // Full text content is already captured via innerText above.
     } else {
       // Pass-through: non-interactive container, recurse at same depth
       walkNode(el, depth, state);
@@ -224,7 +221,7 @@
             ', left=' + si.left + ', right=' + si.right + '"';
         }
 
-        var prefix = '';
+        var prefix = el.isNew ? '*' : '';
         str += indent + prefix + '[' + el.index + ']<' + el.tag + attrsStr + '>' + el.text + '</' + el.tag + '>\n';
       }
     }

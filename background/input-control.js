@@ -100,4 +100,32 @@ export class InputControlBridge {
     }
     this._pending.clear();
   }
+
+  /**
+   * Immediately abort any in-flight command and stop the native host.
+   *
+   * 1. Rejects all pending promises right away so awaiting JS code unblocks.
+   * 2. Disconnects the port — Chrome closes Python's stdin, which triggers
+   *    the EOF path in serve_forever() and sets the cancel_event so the
+   *    Python typing/mouse loop stops within one inter-key delay (~50-100 ms).
+   *
+   * After abort() the bridge is fully reset; the next execute() call will
+   * reconnect to a fresh native host process.
+   */
+  abort() {
+    // Step 1: reject all pending promises immediately
+    const abortError = new InputControlError('Aborted: stop was requested');
+    abortError.name = 'InputControlAbortError';
+    for (const { reject, timer } of this._pending.values()) {
+      clearTimeout(timer);
+      reject(abortError);
+    }
+    this._pending.clear();
+
+    // Step 2: disconnect port → sends EOF to Python → cancels the in-flight op
+    if (this._port) {
+      this._port.disconnect();
+      this._port = null;
+    }
+  }
 }

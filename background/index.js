@@ -1,4 +1,5 @@
 export { AgentCore } from './agent.js';
+export { formatDebugEntry, makeDebugFilename } from './debug-logger.js';
 export { BrowserBridge } from './browser-bridge.js';
 export { ActionExecutor } from './executor.js';
 export { InputControlBridge } from './input-control.js';

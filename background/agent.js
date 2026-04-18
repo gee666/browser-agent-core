@@ -27,6 +27,7 @@ export class AgentCore {
     maxIterations = 20,
     useVision = false,
     onStatus = () => {},
+    debugLog = null,
   }) {
     this._bridge = bridge;
     this._executor = executor;
@@ -34,11 +35,14 @@ export class AgentCore {
     this._maxIterations = maxIterations;
     this._useVision = useVision;
     this._onStatus = onStatus;
+    this._debugLog = debugLog;   // fn({ sessionId, stepNum, turnNum, turnType, task, url, title, system, messages, screenshot, response, timestamp }) | null
     this._stopped = false;
     this._history = [];
     // Loop detection: track last 6 (url, actionStr) pairs so we can spot
     // identical actions being repeated on the same page with no progress.
     this._recentActions = [];
+    this._sessionId = null;
+    this._turnCounter = 0;
   }
 
   /** Signal the running loop to stop after the current iteration. */
@@ -77,6 +81,9 @@ export class AgentCore {
     this._url = null;
     this._title = null;
     this._history = [];
+    // Generate a fresh session ID and reset turn counter for this run
+    this._sessionId = Math.random().toString(36).slice(2, 8);
+    this._turnCounter = 0;
 
     this._status({ state: 'running' });
 
@@ -102,19 +109,20 @@ export class AgentCore {
 
       let screenshot = null;
       if (this._useVision) {
-        screenshot = await this._compressScreenshot(await this._bridge.takeScreenshot());
+        screenshot = await this._compressScreenshot(await this._bridge.takeScreenshot(), pageState);
       }
 
       this._status({ state: 'thinking' });
 
       const userMsg = this._assembleUserMessage(task, pageState, stepNum);
+      const systemPrompt = this.systemPrompt();
 
       // Call LLM with a single-message array; history is embedded in the user message text.
-      let raw = await this._llm.complete({
-        system: this.systemPrompt(),
-        messages: [{ role: 'user', content: userMsg }],
-        screenshot,
-      });
+      const mainMessages = [{ role: 'user', content: userMsg }];
+      let raw = await this._llmComplete(
+        { system: systemPrompt, messages: mainMessages, screenshot },
+        { stepNum, turnType: 'main' }
+      );
 
       // ── Parse JSON (with one retry on failure) ─────────────────────────────
       let parsed = null;
@@ -122,15 +130,15 @@ export class AgentCore {
         parsed = parseJSONFromText(raw);
       } catch (_) {
         // First parse failed — send the bad response back and ask for valid JSON.
-        raw = await this._llm.complete({
-          system: this.systemPrompt(),
-          messages: [
-            { role: 'user',      content: userMsg },
-            { role: 'assistant', content: raw },
-            { role: 'user',      content: 'Your response was not valid JSON. Reply with ONLY a raw JSON object — no prose, no markdown, no code fences.' },
-          ],
-          screenshot: null,
-        });
+        const retryMessages = [
+          { role: 'user',      content: userMsg },
+          { role: 'assistant', content: raw },
+          { role: 'user',      content: 'Your response was not valid JSON. Reply with ONLY a raw JSON object — no prose, no markdown, no code fences.' },
+        ];
+        raw = await this._llmComplete(
+          { system: systemPrompt, messages: retryMessages, screenshot: null },
+          { stepNum, turnType: 'json-retry' }
+        );
         try {
           parsed = parseJSONFromText(raw);
         } catch (e2) {
@@ -142,15 +150,15 @@ export class AgentCore {
       // ── Validate action (with one retry if invalid) ────────────────────────
       const validationError = this._validateAction(parsed.action, pageState);
       if (validationError) {
-        raw = await this._llm.complete({
-          system: this.systemPrompt(),
-          messages: [
-            { role: 'user',      content: userMsg },
-            { role: 'assistant', content: raw },
-            { role: 'user',      content: `Invalid action: ${validationError}` },
-          ],
-          screenshot: null,
-        });
+        const validationMessages = [
+          { role: 'user',      content: userMsg },
+          { role: 'assistant', content: raw },
+          { role: 'user',      content: `Invalid action: ${validationError}` },
+        ];
+        raw = await this._llmComplete(
+          { system: systemPrompt, messages: validationMessages, screenshot: null },
+          { stepNum, turnType: 'validation-retry' }
+        );
         try {
           parsed = parseJSONFromText(raw);
         } catch (e2) {
@@ -210,6 +218,11 @@ export class AgentCore {
 
       try {
         await this._executor.execute(action, pageState);
+        // If stop() was called while the executor was running, abort cleanly now.
+        if (this._stopped) {
+          this._status({ state: 'stopped' });
+          return null;
+        }
         // Record what ran so the LLM knows the action succeeded.
         // Without this, models repeat the same action every step because they
         // see an empty Action Result and assume nothing happened.
@@ -233,6 +246,13 @@ export class AgentCore {
             `or — if a popup or overlay is blocking — try dismissing it first.</sys>`;
         }
       } catch (err) {
+        // Stop was requested while the executor was running (e.g. mid-typing).
+        // The abort() on the InputControlBridge rejected the promise; treat it
+        // as a clean stop rather than an error.
+        if (this._stopped || err.name === 'InputControlAbortError') {
+          this._status({ state: 'stopped' });
+          return null;
+        }
         if (err.name === 'ExecutorError') {
           // Recoverable: record the failure in history so the LLM can adapt
           // (e.g. stale index, element off-screen, page changed).
@@ -400,14 +420,17 @@ export class AgentCore {
 
     let raw;
     try {
-      raw = await this._llm.complete({
-        system:
-          'You are a task verification assistant for a browser automation agent. ' +
-          'Examine the current browser state and confirm whether the task was completed. ' +
-          'Reply ONLY with raw JSON: {"verified": true/false, "message": "...", "reason": "..."}',
-        messages: [{ role: 'user', content: verifyPrompt }],
-        screenshot,
-      });
+      raw = await this._llmComplete(
+        {
+          system:
+            'You are a task verification assistant for a browser automation agent. ' +
+            'Examine the current browser state and confirm whether the task was completed. ' +
+            'Reply ONLY with raw JSON: {"verified": true/false, "message": "...", "reason": "..."}',
+          messages: [{ role: 'user', content: verifyPrompt }],
+          screenshot,
+        },
+        { stepNum: this._iteration, turnType: 'verify' }
+      );
     } catch (_) {
       // If the verification call itself fails, assume success to avoid breaking flow
       return { verified: true, message: doneMsg, reason: '' };
@@ -430,14 +453,53 @@ export class AgentCore {
   }
 
   /**
+   * Wrapper around this._llm.complete() that fires the debug log callback when
+   * debug mode is active.  Drop-in replacement for direct _llm.complete calls.
+   *
+   * @param {object} params     - Passed as-is to this._llm.complete()
+   * @param {object} meta
+   * @param {number} meta.stepNum   - 0-based agent step
+   * @param {string} meta.turnType  - 'main' | 'json-retry' | 'validation-retry' | 'verify'
+   * @returns {Promise<string>}
+   */
+  async _llmComplete(params, { stepNum, turnType }) {
+    const response = await this._llm.complete(params);
+    if (this._debugLog) {
+      this._turnCounter++;
+      try {
+        this._debugLog({
+          sessionId:    this._sessionId,
+          stepNum,
+          turnNum:      this._turnCounter,
+          turnType,
+          task:         this._task || '',
+          url:          this._url  || '',
+          title:        this._title || '',
+          system:       params.system,
+          messages:     params.messages,
+          screenshot:   params.screenshot || null,
+          response,
+          timestamp:    Date.now(),
+        });
+      } catch (logErr) {
+        // Never let logging break the agent
+        console.warn('[AgentCore] debugLog callback threw:', logErr);
+      }
+    }
+    return response;
+  }
+
+  /**
    * Compress a PNG screenshot data URL into a smaller JPEG using OffscreenCanvas.
    * Scales down to max 1280px wide and encodes at 70% JPEG quality.
+   * Optionally overlays red numbered badges on each interactive element.
    * Falls back to the original data URL if compression fails.
    *
    * @param {string|null} dataUrl
+   * @param {object|null} [pageState]  - pageState with .elements, .viewportWidth, .viewportHeight
    * @returns {Promise<string|null>}
    */
-  async _compressScreenshot(dataUrl) {
+  async _compressScreenshot(dataUrl, pageState = null) {
     if (!dataUrl) return null;
     try {
       const res = await fetch(dataUrl);
@@ -453,6 +515,53 @@ export class AgentCore {
       const ctx = canvas.getContext('2d');
       ctx.drawImage(bitmap, 0, 0, w, h);
       bitmap.close();
+
+      // ── Annotate interactive elements with red index badges ──────────────
+      if (pageState && Array.isArray(pageState.elements) && pageState.elements.length > 0) {
+        const vw = pageState.viewportWidth || 1;
+        const vh = pageState.viewportHeight || 1;
+        const scaleX = w / vw;
+        const scaleY = h / vh;
+
+        for (const el of pageState.elements) {
+          if (!el.inViewport) continue;
+          const { x, y, w: ew, h: eh } = el.rect;
+          // Centre of the element in canvas coordinates
+          const cx = Math.round((x + ew / 2) * scaleX);
+          const cy = Math.round((y + eh / 2) * scaleY);
+
+          const label = String(el.index);
+          const fontSize = Math.max(10, Math.min(16, Math.round(12 * scaleX)));
+          ctx.font = `bold ${fontSize}px sans-serif`;
+          const textMetrics = ctx.measureText(label);
+          const padding = 3;
+          const badgeW = Math.round(textMetrics.width + padding * 2);
+          const badgeH = fontSize + padding * 2;
+          const bx = cx - Math.round(badgeW / 2);
+          const by = cy - Math.round(badgeH / 2);
+
+          // Red rounded-rect background
+          const r = Math.min(4, Math.round(badgeH / 2));
+          ctx.beginPath();
+          ctx.moveTo(bx + r, by);
+          ctx.lineTo(bx + badgeW - r, by);
+          ctx.quadraticCurveTo(bx + badgeW, by, bx + badgeW, by + r);
+          ctx.lineTo(bx + badgeW, by + badgeH - r);
+          ctx.quadraticCurveTo(bx + badgeW, by + badgeH, bx + badgeW - r, by + badgeH);
+          ctx.lineTo(bx + r, by + badgeH);
+          ctx.quadraticCurveTo(bx, by + badgeH, bx, by + badgeH - r);
+          ctx.lineTo(bx, by + r);
+          ctx.quadraticCurveTo(bx, by, bx + r, by);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(220, 30, 30, 0.9)';
+          ctx.fill();
+
+          // White text
+          ctx.fillStyle = '#ffffff';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(label, bx + padding, by + Math.round(badgeH / 2));
+        }
+      }
 
       const jpegBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.7 });
 
