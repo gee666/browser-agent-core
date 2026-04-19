@@ -405,14 +405,38 @@ export class AgentCore {
   async _verifyDone(task, doneAction, pageState, screenshot) {
     const doneMsg = doneAction.message ?? '';
 
+    // Summarise the last few steps so the verifier has evidence of what
+    // the agent actually did. Without this, tasks that end with a state
+    // change the final page doesn't reflect — e.g. clicking Send in Gmail
+    // returns to the inbox with no visible trace of the reply — look
+    // incomplete on the final page alone.
+    const recent = this._history.slice(-8);
+    const historyBlock = recent.length
+      ? recent.map(h =>
+          `  step ${h.stepNumber}: ${h.nextGoal || '(no goal)'} — ${h.actionResult || '(no result recorded)'}`
+        ).join('\n')
+      : '  (no prior steps)';
+
     const verifyPrompt =
       `Original task: "${task}"\n\n` +
       `The agent declared completion with: "${doneMsg}"\n\n` +
+      `Summary of the agent's recent steps (most recent last):\n${historyBlock}\n\n` +
       `Current page URL: ${pageState.url}\n` +
       `Current page content:\n${pageState.domText || '(empty)'}\n\n` +
-      `Looking at the current page state${
-        screenshot ? ' and screenshot' : ''
-      }, was the task truly and fully completed?\n\n` +
+      `Was the task truly completed? Use ALL of the evidence:\n` +
+      `  • the recorded step history above (what the agent actually did),\n` +
+      `  • the current page content and any \`current-value="..."\` attributes\n` +
+      `    on form fields, which show what the user typed,\n` +
+      `  • the current URL (navigation away from a compose/form page after a\n` +
+      `    Send/Submit click is normal evidence of success — do NOT demand\n` +
+      `    that typed text still be visible on the current page in that case),\n` +
+      `  • the screenshot if provided.\n\n` +
+      `Only mark the task as NOT verified when there is concrete evidence it\n` +
+      `is still pending — e.g. a form that still shows an empty required\n` +
+      `field the agent never filled, a visible error message, or a next-step\n` +
+      `button the agent clearly still needs to press. Absence of evidence on\n` +
+      `the final page is NOT evidence of absence when the step history shows\n` +
+      `the action succeeded.\n\n` +
       `Reply ONLY with raw JSON — no prose, no markdown:\n` +
       `  {"verified": true, "message": "one-line success summary"}\n` +
       `  OR\n` +
@@ -424,7 +448,10 @@ export class AgentCore {
         {
           system:
             'You are a task verification assistant for a browser automation agent. ' +
-            'Examine the current browser state and confirm whether the task was completed. ' +
+            'You have access to the agent\'s step-by-step history AND the current ' +
+            'browser state. Use BOTH sources of evidence. Prefer the step history ' +
+            'when a successful action (Send, Submit, Post) would naturally leave ' +
+            'the final page without a direct visual trace. ' +
             'Reply ONLY with raw JSON: {"verified": true/false, "message": "...", "reason": "..."}',
           messages: [{ role: 'user', content: verifyPrompt }],
           screenshot,
@@ -597,6 +624,10 @@ Elements appear as:
   [index]<tag attr=value>text</tag>
   \\t         = child of the element above (DOM hierarchy)
   data-scrollable="top=0, bottom=340" = this element is scrollable, 340px below
+  current-value="..." = the text the user has already typed into this form field
+    (inputs, textareas, contenteditable surfaces). Use it to tell whether a field
+    is already filled before typing again, and as evidence that a previous
+    typing action succeeded.
 
 Only elements with [index] are interactive. Use ONLY those indices.
 Pure text lines without [index] are informational only.

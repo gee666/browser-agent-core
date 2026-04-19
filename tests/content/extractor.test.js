@@ -207,4 +207,80 @@ describe('extractor', () => {
     expect(settled).toEqual({ settled: true });
   }, 10000);
 
+  // ── current-value surfacing (done-verification fix) ────────────────────────
+  // Guards against a regression where the verifier thinks a typed field is
+  // empty because .value is not part of innerText/textContent.
+
+  test('test_textarea_value_surfaced_in_element_and_domText', () => {
+    document.body.innerHTML = '<textarea>Hello there, thanks for reaching out!</textarea>';
+    const state = getPageState();
+    const ta = state.elements.find((e) => e.tag === 'textarea');
+    expect(ta).toBeDefined();
+    expect(ta.currentValue).toBe('Hello there, thanks for reaching out!');
+    expect(state.domText).toContain('current-value="Hello there, thanks for reaching out!"');
+  });
+
+  test('test_input_text_value_surfaced', () => {
+    document.body.innerHTML = '<input type="text" placeholder="Search" />';
+    document.querySelector('input').value = 'laptops on sale';
+    const state = getPageState();
+    const input = state.elements.find((e) => e.tag === 'input');
+    expect(input.currentValue).toBe('laptops on sale');
+    expect(state.domText).toContain('current-value="laptops on sale"');
+  });
+
+  test('test_input_password_value_is_never_surfaced', () => {
+    document.body.innerHTML = '<input type="password" />';
+    document.querySelector('input').value = 'hunter2';
+    const state = getPageState();
+    const input = state.elements.find((e) => e.tag === 'input');
+    expect(input).toBeDefined();
+    expect(input.currentValue).toBe('');
+    expect(state.domText).not.toContain('hunter2');
+  });
+
+  // The root cause of the Gmail-reply verification failure: the label slice
+  // cap of 80 chars wiped out the evidence the reply was typed.
+  test('test_long_textarea_value_is_not_truncated_at_80_chars', () => {
+    const longReply =
+      'Thank you for reaching out about the project — I am excited to help. ' +
+      'Let me share a few thoughts on the timeline, the deliverables, and the ' +
+      'review process so we can align before next week, including a draft ' +
+      'proposal and a rough schedule.';
+    expect(longReply.length).toBeGreaterThan(200);
+    document.body.innerHTML = '<textarea></textarea>';
+    document.querySelector('textarea').value = longReply;
+    const state = getPageState();
+    const ta = state.elements.find((e) => e.tag === 'textarea');
+    expect(ta.currentValue).toBe(longReply);
+    expect(state.domText).toContain(longReply);
+  });
+
+  // Gmail's reply compose box is a contenteditable div, not a textarea;
+  // without this, the verifier saw nothing after a successful `type`.
+  test('test_contenteditable_value_surfaced', () => {
+    document.body.innerHTML =
+      '<div role="textbox" contenteditable="true" aria-label="Message Body">' +
+      'Hi Alice, thanks for the update!' +
+      '</div>';
+    const state = getPageState();
+    const box = state.elements.find((e) => e.attrs && e.attrs['aria-label'] === 'Message Body');
+    expect(box).toBeDefined();
+    expect(box.currentValue).toBe('Hi Alice, thanks for the update!');
+    expect(state.domText).toContain('current-value="Hi Alice, thanks for the update!"');
+  });
+
+  test('test_empty_textarea_has_no_current_value_attribute', () => {
+    document.body.innerHTML = '<textarea placeholder="Reply"></textarea>';
+    const state = getPageState();
+    expect(state.domText).not.toContain('current-value=');
+  });
+
+  test('test_current_value_escapes_double_quotes', () => {
+    document.body.innerHTML = '<input type="text" />';
+    document.querySelector('input').value = 'She said "hello" twice';
+    const state = getPageState();
+    expect(state.domText).toContain('current-value="She said &quot;hello&quot; twice"');
+  });
+
 });

@@ -137,11 +137,63 @@
       rect.right > 0
     );
 
+    // Capture the CURRENT user-entered content of form controls and
+    // contenteditable surfaces so that downstream consumers (the agent LLM,
+    // and especially the done-verification pass) can actually see what was
+    // typed.  Without this, the verifier reads an empty-looking element
+    // after a long `type` action and incorrectly concludes the input never
+    // happened — text typed into a native <input>/<textarea> lives on
+    // `.value`, not in innerText/textContent, and even contenteditable text
+    // gets truncated to 80 chars in the label `text` field above.
+    //
+    // Stored separately from `text` so the existing label heuristics and
+    // dedup logic keep working untouched.  The serializer renders this as
+    // a `current-value="..."` attribute on the element line so the LLM
+    // sees the value naturally alongside the other attributes.
+    var currentValue = '';
+    try {
+      var _tag = el.tagName;
+      if (_tag === 'INPUT') {
+        var itype = (el.getAttribute('type') || '').toLowerCase();
+        // Password values must never leak into prompts/logs.
+        if (itype !== 'password' && itype !== 'hidden' && itype !== 'file') {
+          if (itype === 'checkbox' || itype === 'radio') {
+            currentValue = el.checked ? 'checked' : '';
+          } else {
+            currentValue = typeof el.value === 'string' ? el.value : '';
+          }
+        }
+      } else if (_tag === 'TEXTAREA') {
+        currentValue = typeof el.value === 'string' ? el.value : '';
+      } else if (_tag === 'SELECT') {
+        // Report the selected option's visible label, not its underlying value.
+        var selOpt = el.options && el.options[el.selectedIndex];
+        if (selOpt) {
+          currentValue = (selOpt.textContent || selOpt.value || '').replace(/\s+/g, ' ').trim();
+        }
+      } else if (el.getAttribute('contenteditable') === 'true' ||
+                 el.getAttribute('contenteditable') === 'plaintext-only') {
+        // For rich-text compose surfaces (Gmail, Slack, etc.) prefer innerText
+        // so the rendered, human-visible content wins over raw HTML.
+        var _ct = (typeof el.innerText === 'string' ? el.innerText : '') || el.textContent || '';
+        currentValue = _ct;
+      }
+    } catch (_) {
+      currentValue = '';
+    }
+    if (currentValue) {
+      // Collapse whitespace and cap at 500 chars so long replies survive into
+      // the verifier's prompt without blowing up the DOM-text budget.  80
+      // chars (the label cap) is far too short for real message content.
+      currentValue = currentValue.replace(/\s+/g, ' ').trim().slice(0, 500);
+    }
+
     return {
       index: index,
       tag: el.tagName.toLowerCase(),
       attrs: attrs,
       text: text,
+      currentValue: currentValue,
       rect: {
         x: Math.round(rect.left),
         y: Math.round(rect.top),
@@ -214,6 +266,14 @@
         var attrKeys = Object.keys(el.attrs);
         for (var j = 0; j < attrKeys.length; j++) {
           attrsStr += ' ' + attrKeys[j] + '="' + el.attrs[attrKeys[j]] + '"';
+        }
+        // Surface the current user-entered value for form controls and
+        // contenteditable surfaces so the LLM (and the done-verification
+        // pass) can actually see what was typed.  Escape embedded double
+        // quotes so the pseudo-HTML stays well-formed.
+        if (el.currentValue) {
+          var cvEsc = el.currentValue.replace(/"/g, '&quot;');
+          attrsStr += ' current-value="' + cvEsc + '"';
         }
         if (el.scrollInfo) {
           var si = el.scrollInfo;

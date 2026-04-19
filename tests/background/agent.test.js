@@ -552,4 +552,78 @@ describe('AgentCore', () => {
     expect(userMsg).toContain('Click me');
     expect(userMsg).toContain('https://example.com');
   });
+
+  // ── _verifyDone prompt enrichment (Gmail-reply verification fix) ────────────
+  // Guards against the regression where done-verification ignored the agent's
+  // step history and ruled tasks incomplete because the final page didn't
+  // obviously reflect the action (e.g. Send in Gmail returns to inbox).
+
+  test('test_verify_done_prompt_includes_step_history_and_guidance', async () => {
+    // Run: step 0 types a reply, step 1 clicks Send, step 2 declares done.
+    // The 4th LLM call is the verification pass; it should embed the history
+    // and the new guidance.
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const responses = [
+      JSON.stringify({
+        evaluation_previous_goal: 'Page loaded',
+        memory: 'Opened the reply form',
+        next_goal: 'Type the reply body',
+        action: { type: { index: 0, text: 'Thank you for reaching out!' } },
+      }),
+      JSON.stringify({
+        evaluation_previous_goal: 'Reply typed successfully',
+        memory: 'Reply body is in the compose box',
+        next_goal: 'Click the Send button',
+        action: { click: { index: 1 } },
+      }),
+      makeDoneResponse('Reply sent successfully'),
+      // Verifier response:
+      JSON.stringify({ verified: true, message: 'Reply confirmed' }),
+    ];
+    const capturedPrompts = [];
+    const llm = { complete: jest.fn().mockImplementation(({ messages, system }) => {
+      capturedPrompts.push({ system, content: messages[0].content });
+      const val = responses[Math.min(capturedPrompts.length - 1, responses.length - 1)];
+      return Promise.resolve(val);
+    }) };
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('reply to the latest email');
+
+    // 4 calls total: 3 agent steps + 1 verification pass.
+    expect(capturedPrompts.length).toBeGreaterThanOrEqual(4);
+    const verifyCall = capturedPrompts[3];
+    expect(verifyCall.system).toContain('task verification assistant');
+    expect(verifyCall.system).toContain('step-by-step history');
+    // History must be embedded so the verifier can see what the agent did.
+    expect(verifyCall.content).toContain("agent's recent steps");
+    expect(verifyCall.content).toContain('Type the reply body');
+    expect(verifyCall.content).toContain('Click the Send button');
+    // Prompt must tell the verifier to treat current-value attributes as evidence.
+    expect(verifyCall.content).toContain('current-value');
+    // And not to demand visual proof after a Send/Submit that navigates away.
+    expect(verifyCall.content.toLowerCase()).toMatch(/send|submit/);
+  });
+
+  test('test_verify_done_still_flags_incomplete_when_llm_says_false', async () => {
+    // Regression guard: the richer prompt must not force "verified: true".
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const responses = [
+      makeDoneResponse('done-1'),
+      // Verifier rejects the first done:
+      JSON.stringify({ verified: false, reason: 'Form field still empty' }),
+      // Agent tries again and declares done:
+      makeDoneResponse('done-2'),
+      // Verifier approves:
+      JSON.stringify({ verified: true, message: 'All good' }),
+    ];
+    const llm = makeLLM(...responses);
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    const result = await agent.run('do the thing');
+    expect(result).toBe('All good');
+    expect(agent._history.some(h => /Form field still empty/.test(h.actionResult))).toBe(true);
+  });
 });
