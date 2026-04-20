@@ -384,9 +384,13 @@
       if (!vel || !vel.isConnected) {
         sendResponse({ ok: false, value: null, reason: 'not found' });
       } else {
-        // inputs and textareas expose .value; contenteditable and others use textContent
-        var val = ('value' in vel) ? vel.value : (vel.textContent || vel.innerText || '');
-        sendResponse({ ok: true, value: val });
+        // inputs/textareas expose .value; contenteditable editors often surface
+        // the live user-visible text more reliably via innerText than textContent.
+        var isContentEditable = !!vel.isContentEditable || vel.getAttribute('contenteditable') === 'true';
+        var val = ('value' in vel)
+          ? vel.value
+          : (isContentEditable ? (vel.innerText || vel.textContent || '') : (vel.textContent || vel.innerText || ''));
+        sendResponse({ ok: true, value: typeof val === 'string' ? val.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '') : val });
       }
       return true;
     }

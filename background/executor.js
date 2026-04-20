@@ -78,6 +78,13 @@ export class ActionExecutor {
       await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1 }, ctx);
       await this._sleep(150);
 
+      // 1b. If supported by the bridge, focus the element before Ctrl+A so the
+      // shortcut targets it reliably. Real input still goes through inputControl.
+      if (typeof this._bridge.focusElement === 'function') {
+        await this._bridge.focusElement(tabId, index);
+        await this._sleep(80);
+      }
+
       // 2. Select all existing content inside the element and delete it.
       await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, ctx);
       await this._sleep(80);
@@ -89,7 +96,10 @@ export class ActionExecutor {
       await this._sleep(200);
 
       // 5. Verify: read back the element value and compare to what was typed.
-      const actual = await this._bridge.getElementValue(tabId, index);
+      // Some rich-text editors (e.g. Gmail compose) update the DOM asynchronously
+      // or replace the focused node after the first keystroke, so do a short
+      // verification window before deciding the attempt failed.
+      const actual = await this._readTypedValueForVerification(tabId, index, text);
       if (this._typeSucceeded(actual, text)) return; // ✓
 
       // Verification failed on this attempt — log and retry if we have attempts left.
@@ -122,14 +132,42 @@ export class ActionExecutor {
    */
   _typeSucceeded(actual, expected) {
     if (actual === null) return true; // can't read — assume ok
-    const a = String(actual).trim();
-    const e = expected.trim();
+    const a = String(actual).replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
+    const e = expected.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
     if (a === e) return true;
     const checkLen = Math.min(e.length, 50);
     return (
       a.slice(0, checkLen) === e.slice(0, checkLen) &&
       a.length >= Math.floor(e.length * 0.8)
     );
+  }
+
+  async _readTypedValueForVerification(tabId, index, expected) {
+    const delays = [0, 120, 250, 400];
+    let actual = null;
+
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) {
+        await this._sleep(delays[attempt]);
+      }
+
+      actual = await this._bridge.getElementValue(tabId, index);
+      if (this._typeSucceeded(actual, expected)) {
+        return actual;
+      }
+
+      // Rebuild the content-script index map once verification starts failing.
+      // This helps pages that swap the editable node after focus/typing.
+      if (attempt === 0 && typeof this._bridge.getPageState === 'function') {
+        try {
+          await this._bridge.getPageState(tabId);
+        } catch {
+          // noop — fall back to the next plain read attempt
+        }
+      }
+    }
+
+    return actual;
   }
 
   async _executeScroll(direction, amount, pageState) {
@@ -214,7 +252,7 @@ export class ActionExecutor {
     const MAX_SCROLL_ATTEMPTS = 3;
 
     for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS && !el.inViewport; attempt++) {
-      await this._scrollToElement(el, pageState);
+      await this._scrollToElement(tabId, index, el, pageState);
       await this._sleep(600);
       const newState = await this._bridge.getPageState(tabId);
       const newEl = newState.elements.find(e => e.index === index);
@@ -249,11 +287,41 @@ export class ActionExecutor {
   }
 
   /**
-   * Scrolls the element into the viewport using python-input-control scroll.
-   * Calculates the pixel delta needed to centre the element vertically and
-   * issues a native scroll event — no browser JS involved.
+   * Scrolls the element into the viewport.
+   * First tries bridge.scrollElementIntoView (native content-script scroll).
+   * Falls back to bridge.scrollToPosition when the content script can't reach
+   * the element (e.g. it returned false / timed out).
+   *
+   * @param {number} tabId
+   * @param {number} index   - element index
+   * @param {object} el      - element descriptor with rect
+   * @param {object} pageState
    */
-  async _scrollToElement(el, pageState) {
+  async _scrollToElement(tabId, index, el, pageState) {
+    if (typeof this._bridge.scrollElementIntoView === 'function') {
+      const ok = await this._bridge.scrollElementIntoView(tabId, index);
+      if (ok) return;
+
+      if (typeof this._bridge.scrollToPosition === 'function') {
+        // Convert viewport-relative rect coordinates to an absolute document
+        // scroll target that centres the element vertically.
+        const maxScrollY = pageState.pageHeight == null
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, pageState.pageHeight - pageState.viewportHeight);
+        const targetScrollY = Math.max(
+          0,
+          Math.min(
+            maxScrollY,
+            Math.round(
+              (pageState.scrollY || 0) + el.rect.y + el.rect.h / 2 - pageState.viewportHeight / 2,
+            ),
+          ),
+        );
+        await this._bridge.scrollToPosition(tabId, pageState.scrollX || 0, targetScrollY);
+        return;
+      }
+    }
+
     const elementCenterY = el.rect.y + el.rect.h / 2;
     const viewportCenterY = pageState.viewportHeight / 2;
     const delta = Math.round(elementCenterY - viewportCenterY);

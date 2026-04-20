@@ -152,6 +152,7 @@ export class BrowserBridge {
     });
   }
 
+
   sendStatus(status) {
     chrome.storage.local.set({ agentStatus: status });
 

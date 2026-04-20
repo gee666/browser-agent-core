@@ -185,6 +185,29 @@ describe('AgentCore', () => {
     expect(statuses).not.toContain('error');
   });
 
+  test('test_stop_during_llm_thinking_prevents_follow_up_execution', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    let resolveLLM;
+    const llm = {
+      complete: jest.fn().mockImplementation(() => new Promise((resolve) => {
+        resolveLLM = resolve;
+      })),
+    };
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    const runPromise = agent.run('do something');
+    while (!resolveLLM) {
+      await Promise.resolve();
+    }
+    agent.stop();
+    resolveLLM(makeClickResponse(0));
+
+    const result = await runPromise;
+    expect(result).toBeNull();
+    expect(executor.execute).not.toHaveBeenCalled();
+  });
+
   test('test_action_result_recorded_on_success', async () => {
     const bridge = createMockBridge();
     const executor = createMockExecutor();
@@ -588,7 +611,7 @@ describe('AgentCore', () => {
       return Promise.resolve(val);
     }) };
 
-    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    const agent = new AgentCore({ bridge, executor, llm, verifyDone: true, onStatus: () => {} });
     await agent.run('reply to the latest email');
 
     // 4 calls total: 3 agent steps + 1 verification pass.
@@ -621,7 +644,7 @@ describe('AgentCore', () => {
     ];
     const llm = makeLLM(...responses);
 
-    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    const agent = new AgentCore({ bridge, executor, llm, verifyDone: true, onStatus: () => {} });
     const result = await agent.run('do the thing');
     expect(result).toBe('All good');
     expect(agent._history.some(h => /Form field still empty/.test(h.actionResult))).toBe(true);

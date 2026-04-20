@@ -120,6 +120,25 @@ describe('ActionExecutor v2', () => {
     expect(targetScrollY).toBe(560);
   });
 
+  test('test_fallback_to_scrollToPosition_accounts_for_current_scrollY', async () => {
+    mockBridge.scrollElementIntoView.mockResolvedValue(false);
+    mockBridge.getPageState.mockResolvedValue(scrolledState);
+    const executor = makeExecutor();
+    const scrolledPageState = { ...defaultPageState, scrollY: 200, pageHeight: 2400 };
+    const offscreenPageState = {
+      ...scrolledPageState,
+      elements: [
+        defaultPageState.elements[0],
+        { ...defaultPageState.elements[1], rect: { x: 100, y: 900, w: 200, h: 40 }, inViewport: false },
+      ],
+    };
+
+    await executor.execute({ click: { index: 1 } }, offscreenPageState);
+
+    const [, , targetScrollY] = mockBridge.scrollToPosition.mock.calls[0];
+    expect(targetScrollY).toBe(760);
+  });
+
   // 2c. element still out of viewport after max attempts → throws ExecutorError
   test('test_coords_outside_viewport_throws_after_max_attempts', async () => {
     // getPageState always returns element 1 as out-of-viewport

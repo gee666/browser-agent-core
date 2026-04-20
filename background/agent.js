@@ -26,6 +26,7 @@ export class AgentCore {
     llm,
     maxIterations = 20,
     useVision = false,
+    verifyDone = false,
     onStatus = () => {},
     debugLog = null,
   }) {
@@ -35,6 +36,7 @@ export class AgentCore {
     this._maxIterations = maxIterations;
     this._useVision = useVision;
     this._onStatus = onStatus;
+    this._verifyDoneEnabled = verifyDone;
     this._debugLog = debugLog;   // fn({ sessionId, stepNum, turnNum, turnType, task, url, title, system, messages, screenshot, response, timestamp }) | null
     this._stopped = false;
     this._history = [];
@@ -123,6 +125,10 @@ export class AgentCore {
         { system: systemPrompt, messages: mainMessages, screenshot },
         { stepNum, turnType: 'main' }
       );
+      if (this._stopped) {
+        this._status({ state: 'stopped' });
+        return null;
+      }
 
       // ── Parse JSON (with one retry on failure) ─────────────────────────────
       let parsed = null;
@@ -139,6 +145,10 @@ export class AgentCore {
           { system: systemPrompt, messages: retryMessages, screenshot: null },
           { stepNum, turnType: 'json-retry' }
         );
+        if (this._stopped) {
+          this._status({ state: 'stopped' });
+          return null;
+        }
         try {
           parsed = parseJSONFromText(raw);
         } catch (e2) {
@@ -159,6 +169,10 @@ export class AgentCore {
           { system: systemPrompt, messages: validationMessages, screenshot: null },
           { stepNum, turnType: 'validation-retry' }
         );
+        if (this._stopped) {
+          this._status({ state: 'stopped' });
+          return null;
+        }
         try {
           parsed = parseJSONFromText(raw);
         } catch (e2) {
@@ -195,7 +209,17 @@ export class AgentCore {
 
       const action = parsed.action || {};
 
+      if (this._stopped) {
+        this._status({ state: 'stopped' });
+        return null;
+      }
+
       if (action.done) {
+        const doneMsg = action.done.message ?? '';
+        if (!this._verifyDoneEnabled) {
+          this._status({ state: 'done', message: doneMsg });
+          return doneMsg;
+        }
         // Take a fresh screenshot for verification (if vision enabled)
         let verifyShot = null;
         if (this._useVision) {
@@ -468,10 +492,17 @@ export class AgentCore {
       if (parsed.verified === true) {
         return { verified: true, message: parsed.message || doneMsg, reason: '' };
       }
+      if (parsed.verified === false) {
+        return {
+          verified: false,
+          message: doneMsg,
+          reason: parsed.reason || 'Verification did not confirm task completion',
+        };
+      }
       return {
         verified: false,
         message: doneMsg,
-        reason: parsed.reason || 'Verification did not confirm task completion',
+        reason: 'Verification returned unexpected JSON schema',
       };
     } catch (_) {
       // Parse failure — assume verified
