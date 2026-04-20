@@ -2,9 +2,6 @@ import { LLMProvider } from './base.js';
 import { LLMError } from './utils.js';
 import { generatePKCE, storeTokens, getValidTokens, clearTokens, exchangeCode, OAuthError } from './oauth.js';
 
-// Google OAuth client credentials for Gemini CLI (from pi-ai package)
-const CLIENT_ID = atob('REDACTED_GEMINI_CLIENT_ID');
-const CLIENT_SECRET = atob('REDACTED_GEMINI_CLIENT_SECRET');
 const AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const REDIRECT_URI = 'http://localhost:8085/oauth2callback';
@@ -15,18 +12,50 @@ const SCOPES = [
 ].join(' ');
 const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
 const PROVIDER_KEY = 'gemini-cli';
+const GEMINI_OAUTH_CONFIG_KEY = 'oauth.gemini-cli.config';
 
 export const GEMINI_REDIRECT_URI = REDIRECT_URI;
+
+async function getGeminiClientCredentials() {
+  try {
+    const localModule = await import('./gemini-oauth.local.js');
+    if (localModule?.CLIENT_ID && localModule?.CLIENT_SECRET) {
+      return {
+        clientId: localModule.CLIENT_ID,
+        clientSecret: localModule.CLIENT_SECRET,
+      };
+    }
+  } catch {
+    // Optional local override file is intentionally ignored by git.
+  }
+
+  try {
+    if (globalThis.chrome?.storage?.local) {
+      const data = await chrome.storage.local.get(GEMINI_OAUTH_CONFIG_KEY);
+      const config = data?.[GEMINI_OAUTH_CONFIG_KEY];
+      if (config?.clientId && config?.clientSecret) {
+        return config;
+      }
+    }
+  } catch {
+    // Ignore storage lookup failures and fall through to the explicit error below.
+  }
+
+  throw new OAuthError(
+    'Missing Gemini OAuth client credentials. Add background/llm/gemini-oauth.local.js or store oauth.gemini-cli.config in chrome.storage.local.'
+  );
+}
 
 /**
  * Build the Google authorization URL.
  * Returns { url, verifier, state }.
  */
 export async function buildGeminiAuthUrl() {
+  const { clientId } = await getGeminiClientCredentials();
   const { verifier, challenge } = await generatePKCE();
   const state = verifier; // same pattern as Gemini CLI
   const params = new URLSearchParams({
-    client_id: CLIENT_ID,
+    client_id: clientId,
     response_type: 'code',
     redirect_uri: REDIRECT_URI,
     scope: SCOPES,
@@ -44,9 +73,10 @@ export async function buildGeminiAuthUrl() {
  * Returns { access, refresh, expires, projectId, email }.
  */
 export async function exchangeGeminiCode(code, verifier) {
+  const { clientId, clientSecret } = await getGeminiClientCredentials();
   const data = await exchangeCode(TOKEN_URL, {
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
+    client_id: clientId,
+    client_secret: clientSecret,
     code,
     grant_type: 'authorization_code',
     redirect_uri: REDIRECT_URI,
@@ -73,10 +103,11 @@ export async function exchangeGeminiCode(code, verifier) {
  * Refresh a Google Cloud access token.
  */
 export async function refreshGeminiToken(refreshToken, prevTokens) {
+  const { clientId, clientSecret } = await getGeminiClientCredentials();
   const projectId = prevTokens?.projectId;
   const data = await exchangeCode(TOKEN_URL, {
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
+    client_id: clientId,
+    client_secret: clientSecret,
     refresh_token: refreshToken,
     grant_type: 'refresh_token',
   }, true /* form-urlencoded */);
