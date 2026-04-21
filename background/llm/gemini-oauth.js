@@ -1,6 +1,6 @@
 import { LLMProvider } from './base.js';
 import { LLMError } from './utils.js';
-import { generatePKCE, storeTokens, getValidTokens, clearTokens, exchangeCode, OAuthError } from './oauth.js';
+import { generatePKCE, storeTokens, getValidTokens, clearTokens, getCredentials, storeCredentials, exchangeCode, OAuthError } from './oauth.js';
 
 const AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -12,29 +12,24 @@ const SCOPES = [
 ].join(' ');
 const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
 const PROVIDER_KEY = 'gemini-cli';
-const GEMINI_OAUTH_CONFIG_KEY = 'oauth.gemini-cli.config';
+const LEGACY_GEMINI_OAUTH_CONFIG_KEY = 'oauth.gemini-cli.config';
 
 export const GEMINI_REDIRECT_URI = REDIRECT_URI;
 
 async function getGeminiClientCredentials() {
   try {
-    const localModule = await import('./gemini-oauth.local.js');
-    if (localModule?.CLIENT_ID && localModule?.CLIENT_SECRET) {
-      return {
-        clientId: localModule.CLIENT_ID,
-        clientSecret: localModule.CLIENT_SECRET,
-      };
+    const credentials = await getCredentials(PROVIDER_KEY);
+    if (credentials?.clientId && credentials?.clientSecret) {
+      return credentials;
     }
-  } catch {
-    // Optional local override file is intentionally ignored by git.
-  }
 
-  try {
     if (globalThis.chrome?.storage?.local) {
-      const data = await chrome.storage.local.get(GEMINI_OAUTH_CONFIG_KEY);
-      const config = data?.[GEMINI_OAUTH_CONFIG_KEY];
-      if (config?.clientId && config?.clientSecret) {
-        return config;
+      const data = await chrome.storage.local.get(LEGACY_GEMINI_OAUTH_CONFIG_KEY);
+      const legacyConfig = data?.[LEGACY_GEMINI_OAUTH_CONFIG_KEY];
+      if (legacyConfig?.clientId && legacyConfig?.clientSecret) {
+        await storeCredentials(PROVIDER_KEY, legacyConfig);
+        await chrome.storage.local.remove(LEGACY_GEMINI_OAUTH_CONFIG_KEY);
+        return legacyConfig;
       }
     }
   } catch {
@@ -42,7 +37,7 @@ async function getGeminiClientCredentials() {
   }
 
   throw new OAuthError(
-    'Missing Gemini OAuth client credentials. Add background/llm/gemini-oauth.local.js or store oauth.gemini-cli.config in chrome.storage.local.'
+    'Missing Gemini OAuth client credentials in chrome.storage.local at oauth.gemini-cli.credentials.'
   );
 }
 

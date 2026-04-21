@@ -12,7 +12,45 @@ export class NavigationTimeoutError extends Error {
   }
 }
 
+/**
+ * BrowserBridge — Chrome-extension-side transport used by AgentCore and
+ * ActionExecutor.
+ *
+ * Required capabilities (always implemented):
+ *   - getActiveTabId(): Promise<number>
+ *   - getPageState(tabId): Promise<object>
+ *   - takeScreenshot(): Promise<string|null>
+ *   - navigate(url, timeoutMs?): Promise<void>
+ *   - waitForPageSettle(tabId?, ms?): Promise<void>
+ *   - getElementValue(tabId, index): Promise<string|null>
+ *   - sendStatus(status): void
+ *
+ * Optional DOM-assistance capabilities (ActionExecutor feature-detects them):
+ *   - focusElement(tabId, index): Promise<boolean>
+ *       Native content-script DOM focus() to reliably target an element
+ *       before issuing a keyboard shortcut.
+ *   - scrollElementIntoView(tabId, index): Promise<boolean>
+ *       Native content-script scrollIntoView(). Return false to signal the
+ *       executor should fall back to scrollToPosition or a wheel scroll.
+ *   - scrollToPosition(tabId, x, y): Promise<void>
+ *       Native window.scrollTo() fallback used when scrollElementIntoView()
+ *       cannot reach the target.
+ *
+ * Embedders may subclass BrowserBridge or provide a duck-typed replacement
+ * that implements the required capabilities. See AGENTS.md — all user input
+ * (click/type/scroll/keys) MUST flow through python-input-control, not
+ * synthetic browser events.
+ *
+ * Constructor options:
+ *   extractorPath: string — extension-relative path of the content extractor
+ *                          bundle. Defaults to the stock layout used by the
+ *                          official extension; override for custom builds.
+ */
 export class BrowserBridge {
+  constructor({ extractorPath = 'lib/browser-agent-core/content/extractor.js' } = {}) {
+    this._extractorPath = extractorPath;
+  }
+
   async getActiveTabId() {
     return new Promise((resolve, reject) => {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -45,11 +83,18 @@ export class BrowserBridge {
 
     try {
       return await sendMessage(tabId);
-    } catch (_firstError) {
-      // Content script not injected — inject and retry once
+    } catch (firstError) {
+      // Only attempt reinjection when the failure is specifically "content
+      // script not present" (Chrome's wording: "receiving end does not exist").
+      // Other failures — timeouts, restricted pages, permission errors — are
+      // NOT solved by reinjecting, so surface them unchanged instead of
+      // masking the real cause.
+      if (!BrowserBridge._isReceivingEndMissingError(firstError)) {
+        throw firstError;
+      }
       await new Promise((resolve, reject) => {
         chrome.scripting.executeScript(
-          { target: { tabId }, files: ['lib/browser-agent-core/content/extractor.js'] },
+          { target: { tabId }, files: [this._extractorPath] },
           () => {
             if (chrome.runtime.lastError) {
               return reject(new BridgeError(chrome.runtime.lastError.message));
@@ -61,6 +106,21 @@ export class BrowserBridge {
 
       return await sendMessage(tabId);
     }
+  }
+
+  /**
+   * Returns true when the error message indicates the content script is not
+   * loaded in the target tab and reinjection is a valid recovery.
+   * Chrome reports this as "Could not establish connection. Receiving end does
+   * not exist." — match it case-insensitively and conservatively.
+   */
+  static _isReceivingEndMissingError(err) {
+    const msg = (err && err.message) ? String(err.message).toLowerCase() : '';
+    if (!msg) return false;
+    return (
+      msg.includes('receiving end does not exist') ||
+      msg.includes('could not establish connection')
+    );
   }
 
   async takeScreenshot() {

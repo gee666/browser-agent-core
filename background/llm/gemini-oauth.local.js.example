@@ -1,4 +1,0 @@
-// Copy this file to gemini-oauth.local.js and fill in your local credentials.
-// This file is intentionally safe to commit; gemini-oauth.local.js is gitignored.
-export const CLIENT_ID = 'your-google-oauth-client-id.apps.googleusercontent.com';
-export const CLIENT_SECRET = 'your-google-oauth-client-secret';

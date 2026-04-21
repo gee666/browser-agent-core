@@ -126,12 +126,16 @@ export class ActionExecutor {
    *   • The field value starts with the first 50 chars of the expected text, AND
    *   • At least 80 % of the expected length was accepted.
    *
-   * If we could not read the value at all (null) we optimistically assume
-   * success rather than retrying blindly (e.g. rich-text editors that hide
-   * the value from DOM inspection).
+   * A null `actual` is NOT treated as success. Null means we could not read
+   * the field at all, which in practice covers lookup failures, stale index
+   * maps, content-script reinjection, timeouts, or a disappeared element —
+   * none of which are positive confirmation that typing landed. Requiring a
+   * non-null string means `_executeType` retries (and, if the last attempt
+   * also returns null, surfaces a clear ExecutorError) instead of silently
+   * reporting success.
    */
   _typeSucceeded(actual, expected) {
-    if (actual === null) return true; // can't read — assume ok
+    if (actual == null) return false; // no positive confirmation — not success
     const a = String(actual).replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
     const e = expected.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
     if (a === e) return true;

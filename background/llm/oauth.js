@@ -5,8 +5,28 @@
  * state is kept in chrome.storage.session to survive SW restarts.
  */
 
+const OAUTH_STORAGE_PREFIX = 'oauth.';
+const OAUTH_CREDENTIALS_SUFFIX = 'credentials';
+
 export class OAuthError extends Error {
   constructor(message) { super(message); this.name = 'OAuthError'; }
+}
+
+function getOAuthStorageKey(providerKey, suffix = null) {
+  return suffix ? `${OAUTH_STORAGE_PREFIX}${providerKey}.${suffix}` : `${OAUTH_STORAGE_PREFIX}${providerKey}`;
+}
+
+async function getFromStorage(area, key) {
+  const data = await chrome.storage[area].get(key);
+  return data[key] || null;
+}
+
+async function setInStorage(area, key, value) {
+  await chrome.storage[area].set({ [key]: value });
+}
+
+async function removeFromStorage(area, key) {
+  await chrome.storage[area].remove(key);
 }
 
 /**
@@ -42,26 +62,25 @@ export function generateState() {
  * The webNavigation listener (registered at SW top-level) will read this state.
  */
 export async function setPendingOAuth(provider, { verifier, state, tabId = null }) {
-  await chrome.storage.session.set({
-    pendingOAuth: { provider, verifier, state, tabId, startedAt: Date.now() }
+  await setInStorage('session', 'pendingOAuth', {
+    provider, verifier, state, tabId, startedAt: Date.now()
   });
 }
 
 export async function setPendingOAuthTabId(tabId) {
-  const data = await chrome.storage.session.get('pendingOAuth');
-  if (data.pendingOAuth) {
-    data.pendingOAuth.tabId = tabId;
-    await chrome.storage.session.set({ pendingOAuth: data.pendingOAuth });
+  const pendingOAuth = await getPendingOAuth();
+  if (pendingOAuth) {
+    pendingOAuth.tabId = tabId;
+    await setInStorage('session', 'pendingOAuth', pendingOAuth);
   }
 }
 
 export async function getPendingOAuth() {
-  const data = await chrome.storage.session.get('pendingOAuth');
-  return data.pendingOAuth || null;
+  return await getFromStorage('session', 'pendingOAuth');
 }
 
 export async function clearPendingOAuth() {
-  await chrome.storage.session.remove('pendingOAuth');
+  await removeFromStorage('session', 'pendingOAuth');
 }
 
 /**
@@ -69,19 +88,27 @@ export async function clearPendingOAuth() {
  * providerKey: 'openai-codex' | 'anthropic' | 'gemini-cli'
  */
 export async function storeTokens(providerKey, tokens) {
-  const key = `oauth.${providerKey}`;
-  await chrome.storage.local.set({ [key]: tokens });
+  await setInStorage('local', getOAuthStorageKey(providerKey), tokens);
 }
 
 export async function getTokens(providerKey) {
-  const key = `oauth.${providerKey}`;
-  const data = await chrome.storage.local.get(key);
-  return data[key] || null;
+  return await getFromStorage('local', getOAuthStorageKey(providerKey));
 }
 
 export async function clearTokens(providerKey) {
-  const key = `oauth.${providerKey}`;
-  await chrome.storage.local.remove(key);
+  await removeFromStorage('local', getOAuthStorageKey(providerKey));
+}
+
+export async function storeCredentials(providerKey, credentials) {
+  await setInStorage('local', getOAuthStorageKey(providerKey, OAUTH_CREDENTIALS_SUFFIX), credentials);
+}
+
+export async function getCredentials(providerKey) {
+  return await getFromStorage('local', getOAuthStorageKey(providerKey, OAUTH_CREDENTIALS_SUFFIX));
+}
+
+export async function clearCredentials(providerKey) {
+  await removeFromStorage('local', getOAuthStorageKey(providerKey, OAUTH_CREDENTIALS_SUFFIX));
 }
 
 /**

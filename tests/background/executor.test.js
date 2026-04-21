@@ -272,8 +272,14 @@ describe('ActionExecutor v2', () => {
 
   // _executeType: retries once when first attempt value is empty
   test('test_type_retries_when_value_empty', async () => {
-    // First verification returns empty, second returns correct value
+    // _readTypedValueForVerification retries the read up to 4 times with
+    // increasing delays before bubbling up. To force a top-level type retry,
+    // return '' for the entire first verification window and then return the
+    // matching value on the next attempt.
     mockBridge.getElementValue
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('')
       .mockResolvedValueOnce('')
       .mockResolvedValue('hello');
     const executor = makeExecutor();
@@ -292,10 +298,12 @@ describe('ActionExecutor v2', () => {
       .rejects.toThrow(ExecutorError);
   });
 
-  // _typeSucceeded: null value is treated as success (unreadable rich-text editor)
-  test('test_typeSucceeded_null_is_success', () => {
+  // _typeSucceeded: null value is treated as failure (not positive confirmation).
+  // Null covers lookup failure, stale index maps, reinjected content scripts,
+  // or timeouts — none of which actually confirm typing landed.
+  test('test_typeSucceeded_null_is_failure', () => {
     const executor = makeExecutor();
-    expect(executor._typeSucceeded(null, 'anything')).toBe(true);
+    expect(executor._typeSucceeded(null, 'anything')).toBe(false);
   });
 
   // _typeSucceeded: exact match

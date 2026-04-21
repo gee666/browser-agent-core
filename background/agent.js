@@ -27,6 +27,7 @@ export class AgentCore {
     maxIterations = 20,
     useVision = false,
     verifyDone = false,
+    verifyDoneFailOpen = false,
     onStatus = () => {},
     debugLog = null,
   }) {
@@ -37,6 +38,11 @@ export class AgentCore {
     this._useVision = useVision;
     this._onStatus = onStatus;
     this._verifyDoneEnabled = verifyDone;
+    // When verification is enabled but the verifier call fails (network error,
+    // unparsable response), default to fail-CLOSED: treat the task as
+    // unverified so the agent retries instead of silently reporting success.
+    // Embedders that preferred the legacy fail-open behaviour can opt back in.
+    this._verifyDoneFailOpen = verifyDoneFailOpen;
     this._debugLog = debugLog;   // fn({ sessionId, stepNum, turnNum, turnType, task, url, title, system, messages, screenshot, response, timestamp }) | null
     this._stopped = false;
     this._history = [];
@@ -83,6 +89,11 @@ export class AgentCore {
     this._url = null;
     this._title = null;
     this._history = [];
+    // Clear loop-detection state so it never leaks between independent runs.
+    // Without this, a new task starting on the same URL and issuing the same
+    // first action inherits the last run's recent-action log and can be
+    // incorrectly flagged as a loop after a single step.
+    this._recentActions = [];
     // Generate a fresh session ID and reset turn counter for this run
     this._sessionId = Math.random().toString(36).slice(2, 8);
     this._turnCounter = 0;
@@ -366,10 +377,13 @@ export class AgentCore {
     }
 
     const [name, params] = entries[0];
+    const p = (params && typeof params === 'object' && !Array.isArray(params)) ? params : {};
     const INDEX_ACTIONS = new Set(['click', 'type', 'select_option', 'scroll_element']);
+    const SCROLL_DIRECTIONS = new Set(['up', 'down']);
+    const SCROLL_AMOUNTS = new Set(['small', 'medium', 'large']);
 
     if (INDEX_ACTIONS.has(name)) {
-      const index = params?.index;
+      const index = p.index;
       if (typeof index !== 'number') {
         return `Action "${name}" requires a numeric "index" parameter, got: ${JSON.stringify(index)}.`;
       }
@@ -383,6 +397,53 @@ export class AgentCore {
           `${hint} ` +
           `Only use indices shown between [brackets] in the browser state.`
         );
+      }
+    }
+
+    // Per-action shape checks for non-index actions (and extra checks for
+    // scroll_element). Executor handles runtime/environmental failures; this
+    // catches basic schema errors early so the LLM gets a corrective retry.
+    switch (name) {
+      case 'wait': {
+        const s = p.seconds;
+        if (typeof s !== 'number' || !Number.isFinite(s) || s <= 0) {
+          return `Action "wait" requires a finite positive number for "seconds", got: ${JSON.stringify(s)}.`;
+        }
+        break;
+      }
+      case 'navigate': {
+        const url = p.url;
+        if (typeof url !== 'string' || url.trim() === '') {
+          return `Action "navigate" requires a non-empty string "url", got: ${JSON.stringify(url)}.`;
+        }
+        break;
+      }
+      case 'scroll': {
+        if (p.direction !== undefined && !SCROLL_DIRECTIONS.has(p.direction)) {
+          return `Action "scroll" has invalid "direction": ${JSON.stringify(p.direction)}. Must be "up" or "down".`;
+        }
+        if (p.amount !== undefined && !SCROLL_AMOUNTS.has(p.amount)) {
+          return `Action "scroll" has invalid "amount": ${JSON.stringify(p.amount)}. Must be "small", "medium", or "large".`;
+        }
+        break;
+      }
+      case 'scroll_element': {
+        if (p.direction !== undefined && !SCROLL_DIRECTIONS.has(p.direction)) {
+          return `Action "scroll_element" has invalid "direction": ${JSON.stringify(p.direction)}. Must be "up" or "down".`;
+        }
+        if (p.amount !== undefined && !SCROLL_AMOUNTS.has(p.amount)) {
+          return `Action "scroll_element" has invalid "amount": ${JSON.stringify(p.amount)}. Must be "small", "medium", or "large".`;
+        }
+        break;
+      }
+      case 'done': {
+        if (p.success !== undefined && typeof p.success !== 'boolean') {
+          return `Action "done" has invalid "success": ${JSON.stringify(p.success)}. Must be a boolean if provided.`;
+        }
+        if (p.message !== undefined && typeof p.message !== 'string') {
+          return `Action "done" has invalid "message": ${JSON.stringify(p.message)}. Must be a string if provided.`;
+        }
+        break;
       }
     }
 
@@ -482,9 +543,21 @@ export class AgentCore {
         },
         { stepNum: this._iteration, turnType: 'verify' }
       );
-    } catch (_) {
-      // If the verification call itself fails, assume success to avoid breaking flow
-      return { verified: true, message: doneMsg, reason: '' };
+    } catch (err) {
+      // Fail-closed by default: a verification outage must NOT masquerade as
+      // a verified completion. Surface the failure as "unverified" so the
+      // agent retries. Embedders can opt into legacy fail-open via the
+      // verifyDoneFailOpen constructor flag.
+      if (this._verifyDoneFailOpen) {
+        return { verified: true, message: doneMsg, reason: '' };
+      }
+      return {
+        verified: false,
+        message: doneMsg,
+        reason:
+          `Verification call failed (${err?.message || 'unknown error'}). ` +
+          `Treating task as not yet verified — please continue or retry.`,
+      };
     }
 
     try {
@@ -505,8 +578,15 @@ export class AgentCore {
         reason: 'Verification returned unexpected JSON schema',
       };
     } catch (_) {
-      // Parse failure — assume verified
-      return { verified: true, message: doneMsg, reason: '' };
+      // Unparsable verifier response — fail-closed by default.
+      if (this._verifyDoneFailOpen) {
+        return { verified: true, message: doneMsg, reason: '' };
+      }
+      return {
+        verified: false,
+        message: doneMsg,
+        reason: 'Verifier returned unparsable JSON — treating as not yet verified.',
+      };
     }
   }
 

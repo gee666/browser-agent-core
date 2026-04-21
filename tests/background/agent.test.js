@@ -399,6 +399,199 @@ describe('AgentCore', () => {
     expect(retryUserMsg.content).toContain('1');
   });
 
+  // ── per-action schema validation (wait / navigate / scroll) ────────────────
+
+  function makeActionResponse(action) {
+    return JSON.stringify({
+      evaluation_previous_goal: 'N/A',
+      memory: 'mem',
+      next_goal: 'act',
+      action,
+    });
+  }
+
+  test('test_wait_without_seconds_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ wait: {} })) // bad
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('wait');
+    expect(retryUserMsg.content).toContain('seconds');
+  });
+
+  test('test_wait_with_nonpositive_seconds_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ wait: { seconds: 0 } })) // bad
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('wait');
+  });
+
+  test('test_navigate_without_url_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ navigate: {} })) // bad
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('navigate');
+    expect(retryUserMsg.content).toContain('url');
+  });
+
+  test('test_navigate_with_empty_url_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ navigate: { url: '   ' } })) // bad
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('navigate');
+  });
+
+  test('test_scroll_with_invalid_direction_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ scroll: { direction: 'sideways', amount: 'medium' } }))
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('scroll');
+    expect(retryUserMsg.content).toContain('direction');
+  });
+
+  test('test_scroll_with_invalid_amount_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ scroll: { direction: 'down', amount: 'huge' } }))
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('amount');
+  });
+
+  test('test_scroll_with_no_params_is_accepted', async () => {
+    // Missing direction/amount should NOT trigger a validation retry — the
+    // executor already falls back to defaults.
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const llm = makeLLM(
+      makeActionResponse({ scroll: {} }),
+      makeDoneResponse('ok'),
+    );
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    // Exactly 2 LLM calls, no validation retry.
+    expect(llm.complete).toHaveBeenCalledTimes(2);
+  });
+
+  test('test_scroll_element_validates_direction_and_amount', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ scroll_element: { index: 0, direction: 'left' } }))
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('scroll_element');
+    expect(retryUserMsg.content).toContain('direction');
+  });
+
+  test('test_done_with_nonboolean_success_is_rejected', async () => {
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+    const captured = [];
+    const llm = { complete: jest.fn() };
+    llm.complete
+      .mockResolvedValueOnce(makeActionResponse({ done: { success: 'yes', message: 'ok' } }))
+      .mockImplementation(({ messages }) => {
+        captured.push(messages);
+        return Promise.resolve(makeDoneResponse('ok'));
+      });
+
+    const agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('do task');
+
+    const retryUserMsg = captured[0].find(m => m.role === 'user' && m.content.includes('Invalid action'));
+    expect(retryUserMsg).toBeDefined();
+    expect(retryUserMsg.content).toContain('done');
+    expect(retryUserMsg.content).toContain('success');
+  });
+
   test('test_valid_index_does_not_trigger_retry', async () => {
     const bridge = createMockBridge();
     const executor = createMockExecutor();
@@ -472,6 +665,46 @@ describe('AgentCore', () => {
     agent._llm = llm2;
     await agent.run('second run');
     expect(captured[0]).not.toContain('LOOP DETECTED');
+    // Internal state must also be cleared so nothing could leak next time.
+    expect(agent._recentActions).toEqual([]);
+  });
+
+  test('test_no_loop_warning_on_run2_after_run1_ran_same_action', async () => {
+    // Regression: _recentActions used to persist across run() calls, so a
+    // second run that repeated run-1's first action on the same URL was
+    // mislabelled a loop on step 2 even though it was the first repetition
+    // within run 2.
+    const bridge = createMockBridge();
+    const executor = createMockExecutor();
+
+    // Run 1: two clicks on index 0 + done (builds up _recentActions).
+    const llm1 = makeLLM(
+      makeClickResponse(0),
+      makeClickResponse(0),
+      makeDoneResponse('ok'),
+    );
+    const agent = new AgentCore({ bridge, executor, llm: llm1, onStatus: () => {} });
+    await agent.run('first run');
+
+    // Run 2: single click(0) then done — one real action before done so the
+    // 2nd step's user message embeds the prior step's actionResult. If
+    // _recentActions had leaked, the LLM would see 'LOOP DETECTED'.
+    const captured = [];
+    const llm2 = { complete: jest.fn().mockImplementation(({ messages }) => {
+      captured.push(messages[0].content);
+      return Promise.resolve(
+        captured.length === 1 ? makeClickResponse(0) : makeDoneResponse('ok'),
+      );
+    }) };
+    agent._llm = llm2;
+    await agent.run('second run');
+
+    // At least two prompts captured: step 0 and step 1. Neither should carry
+    // a loop warning because run 2 has only executed one action so far.
+    expect(captured.length).toBeGreaterThanOrEqual(2);
+    for (const msg of captured) {
+      expect(msg).not.toContain('LOOP DETECTED');
+    }
   });
 
   test('test_executor_error_is_recoverable_and_agent_continues', async () => {
