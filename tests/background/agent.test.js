@@ -114,6 +114,25 @@ describe('AgentCore', () => {
     expect(executor.execute).toHaveBeenCalledTimes(2);
   });
 
+  test('test_user_steer_sent_while_working_is_included_in_next_llm_call', async () => {
+    const bridge = createMockBridge();
+    const llm = makeLLM(makeClickResponse(0), makeDoneResponse('done'));
+    let agent;
+    const executor = {
+      execute: jest.fn().mockImplementation(async () => {
+        agent.addSteer('Correction: use the Traces tab and filter by projectId abc');
+      }),
+    };
+
+    agent = new AgentCore({ bridge, executor, llm, onStatus: () => {} });
+    await agent.run('find logs');
+
+    expect(llm.complete).toHaveBeenCalledTimes(2);
+    const secondPrompt = llm.complete.mock.calls[1][0].messages[0].content;
+    expect(secondPrompt).toContain('<latest_user_steers priority="critical">');
+    expect(secondPrompt).toContain('Correction: use the Traces tab and filter by projectId abc');
+  });
+
   test('test_max_iterations_respected', async () => {
     const bridge = createMockBridge();
     const executor = createMockExecutor();

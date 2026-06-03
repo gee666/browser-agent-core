@@ -51,6 +51,17 @@ export class AgentCore {
     this._recentActions = [];
     this._sessionId = null;
     this._turnCounter = 0;
+    this._pendingSteers = [];
+  }
+
+  /** Queue a user follow-up/steer to be included in the next LLM turn. */
+  addSteer(message) {
+    const text = typeof message === 'string' ? message.trim() : '';
+    if (!text) return false;
+    this._pendingSteers.push({ text, timestamp: Date.now() });
+    if (this._pendingSteers.length > 20) this._pendingSteers.shift();
+    this._status({ state: 'running', message: 'New user steer queued for the next step.' });
+    return true;
   }
 
   /** Signal the running loop to stop after the current iteration. */
@@ -97,6 +108,7 @@ export class AgentCore {
     // Generate a fresh session ID and reset turn counter for this run
     this._sessionId = Math.random().toString(36).slice(2, 8);
     this._turnCounter = 0;
+    if (!Array.isArray(this._pendingSteers)) this._pendingSteers = [];
 
     this._status({ state: 'running' });
 
@@ -125,9 +137,10 @@ export class AgentCore {
         screenshot = await this._compressScreenshot(await this._bridge.takeScreenshot(), pageState);
       }
 
-      this._status({ state: 'thinking' });
+      this._status({ state: 'thinking', message: 'Reading the page and deciding the next browser action.' });
 
-      const userMsg = this._assembleUserMessage(task, pageState, stepNum);
+      const steersForTurn = this._consumePendingSteers();
+      const userMsg = this._assembleUserMessage(task, pageState, stepNum, steersForTurn);
       const systemPrompt = this.systemPrompt();
 
       // Call LLM with a single-message array; history is embedded in the user message text.
@@ -219,6 +232,14 @@ export class AgentCore {
       }
 
       const action = parsed.action || {};
+      this._status({
+        state: 'thinking',
+        message: parsed.next_goal || parsed.evaluation_previous_goal || 'Planning next action.',
+        evaluation: parsed.evaluation_previous_goal || '',
+        memory: parsed.memory || '',
+        nextGoal: parsed.next_goal || '',
+        plannedAction: action,
+      });
 
       if (this._stopped) {
         this._status({ state: 'stopped' });
@@ -249,7 +270,7 @@ export class AgentCore {
         continue;
       }
 
-      this._status({ state: 'acting', actionsCount: 1 });
+      this._status({ state: 'acting', actionsCount: 1, message: this._describeAction(action), plannedAction: action });
 
       try {
         await this._executor.execute(action, pageState);
@@ -263,6 +284,7 @@ export class AgentCore {
         // see an empty Action Result and assume nothing happened.
         const [actionName, actionParams] = Object.entries(action)[0];
         histEntry.actionResult = `Executed ${actionName}: ${JSON.stringify(actionParams)}`;
+        this._status({ state: 'running', message: histEntry.actionResult, lastAction: histEntry.actionResult });
         // Wait for any triggered navigation or DOM update to settle.
         const tabId2 = await this._bridge.getActiveTabId();
         await this._bridge.waitForPageSettle(tabId2, 1500);
@@ -311,7 +333,30 @@ export class AgentCore {
    * Assemble the single user message sent to the LLM each step.
    * Embeds task context, rolling history, and current browser state.
    */
-  _assembleUserMessage(task, pageState, stepNum) {
+  _consumePendingSteers() {
+    const steers = this._pendingSteers || [];
+    this._pendingSteers = [];
+    return steers;
+  }
+
+  _describeAction(action) {
+    const entry = Object.entries(action || {})[0];
+    if (!entry) return 'Preparing browser action.';
+    const [name, params] = entry;
+    switch (name) {
+      case 'click': return `Clicking element [${params?.index}]`;
+      case 'type': return `Typing into element [${params?.index}]`;
+      case 'select_option': return `Selecting an option in element [${params?.index}]`;
+      case 'scroll': return `Scrolling ${params?.direction || 'down'} (${params?.amount || 'medium'})`;
+      case 'scroll_element': return `Scrolling element [${params?.index}] ${params?.direction || 'down'}`;
+      case 'navigate': return `Navigating to ${params?.url || 'a page'}`;
+      case 'wait': return `Waiting ${params?.seconds || ''} seconds`;
+      case 'done': return 'Preparing final answer';
+      default: return `Running ${name}`;
+    }
+  }
+
+  _assembleUserMessage(task, pageState, stepNum, steersForTurn = []) {
     const sections = [];
 
     sections.push(
@@ -321,6 +366,20 @@ export class AgentCore {
       `Time: ${new Date().toLocaleString()}\n</step_info>\n` +
       `</agent_state>`
     );
+
+    if (steersForTurn.length > 0) {
+      const steerLines = steersForTurn.map((s, i) => {
+        var when = new Date(s.timestamp).toLocaleTimeString();
+        return `${i + 1}. [${when}] ${s.text}`;
+      }).join('\n');
+      sections.push(
+        `<latest_user_steers priority="critical">\n` +
+        `The user sent these instructions while you were working. Follow them now. ` +
+        `If they correct your course, prefer them over the earlier plan.\n` +
+        `${steerLines}\n` +
+        `</latest_user_steers>`
+      );
+    }
 
     if (this._history.length > 0) {
       const histLines = this._history.map(h =>
