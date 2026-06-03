@@ -6,9 +6,12 @@ export class InputControlError extends Error {
 }
 
 export class InputControlTimeoutError extends Error {
-  constructor() {
-    super('Input control command timed out');
+  constructor(command = null, timeoutMs = null) {
+    const suffix = command ? ` (${command}${timeoutMs ? ` after ${timeoutMs}ms` : ''})` : '';
+    super(`Input control command timed out${suffix}`);
     this.name = 'InputControlTimeoutError';
+    this.command = command;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -53,18 +56,24 @@ export class InputControlBridge {
   /**
    * Estimate a reasonable timeout for a command.
    * For 'type', derive it from text length + WPM so long prompts never time out.
-   * Everything else gets a flat 30 s.
+   * Callers may override with params.timeout_ms for diagnostics/tests.
+   * Everything else gets a flat 45 s. CDP/native input can occasionally stall
+   * behind a busy page or OS focus transition; 30 s was too aggressive on
+   * Grafana-heavy pages.
    */
   _timeoutFor(command, params) {
+    if (Number.isFinite(params?.timeout_ms) && params.timeout_ms > 0) {
+      return Math.ceil(params.timeout_ms);
+    }
     if (command === 'type' && typeof params?.text === 'string') {
       const wpm = params.wpm || 60;
       const chars = params.text.length;
       // ms to type the text at the given WPM (1 word ≈ 5 chars)
       const typingMs = Math.ceil((chars / (wpm * 5)) * 60_000);
-      // add 10 s headroom for startup / inter-key jitter
-      return Math.max(30_000, typingMs + 10_000);
+      // add 15 s headroom for startup / inter-key jitter / busy pages
+      return Math.max(45_000, typingMs + 15_000);
     }
-    return 30_000;
+    return 45_000;
   }
 
   async execute(command, params, context) {
@@ -79,13 +88,30 @@ export class InputControlBridge {
       const timer = setTimeout(() => {
         if (this._pending.has(id)) {
           this._pending.delete(id);
-          reject(new InputControlTimeoutError());
+          reject(new InputControlTimeoutError(command, timeoutMs));
+
+          // A native-messaging timeout usually means the host is still blocked
+          // in an OS/CDP input call. Leaving the port alive makes the next
+          // command likely to queue behind the stuck operation and time out too.
+          // Disconnect immediately; Chrome closes the host stdin, which is the
+          // same recovery path used by abort(). The next execute() reconnects a
+          // fresh host process.
+          if (this._port) {
+            try { this._port.disconnect(); } catch (_) { /* ignore */ }
+            this._port = null;
+          }
         }
       }, timeoutMs);
 
       this._pending.set(id, { resolve, reject, timer });
 
-      this._port.postMessage({ id, command, params, context });
+      try {
+        this._port.postMessage({ id, command, params, context });
+      } catch (error) {
+        clearTimeout(timer);
+        this._pending.delete(id);
+        reject(new InputControlError(error instanceof Error ? error.message : String(error)));
+      }
     });
   }
 

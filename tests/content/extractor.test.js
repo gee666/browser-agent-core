@@ -283,4 +283,86 @@ describe('extractor', () => {
     expect(state.domText).toContain('current-value="She said &quot;hello&quot; twice"');
   });
 
+  test('test_focusable_grafana_custom_select_is_extracted', () => {
+    document.body.innerHTML =
+      '<div tabindex="0" data-testid="data-testid Dashboard template variables Variable Value DropDown value link text tempo">' +
+      'Tempo</div>';
+    const state = getPageState();
+    const select = state.elements.find((e) => e.text === 'Tempo');
+    expect(select).toBeDefined();
+    expect(select.attrs.tabindex).toBe('0');
+    expect(select.attrs['data-testid']).toContain('Dashboard template variables');
+  });
+
+  test('test_icon_only_button_uses_testid_fallback_text', () => {
+    document.body.innerHTML =
+      '<button type="button" data-testid="data-testid RefreshPicker run button">' +
+      '<svg data-testid="icon-sync" aria-hidden="true"></svg>' +
+      '</button>';
+    const state = getPageState();
+    const btn = state.elements.find((e) => e.tag === 'button');
+    expect(btn).toBeDefined();
+    expect(btn.text).toBe('RefreshPicker run button');
+    expect(state.domText).toContain('RefreshPicker run button');
+  });
+
+  test('test_aria_labelledby_fallback_text_for_blank_control', () => {
+    document.body.innerHTML =
+      '<span id="trace-label">Trace ID</span>' +
+      '<div role="button" aria-labelledby="trace-label"></div>';
+    const state = getPageState();
+    const btn = state.elements.find((e) => e.attrs.role === 'button');
+    expect(btn).toBeDefined();
+    expect(btn.text).toBe('Trace ID');
+  });
+
+  test('test_treeitem_role_is_interactive_for_virtualized_rows', () => {
+    document.body.innerHTML = '<div role="treeitem" aria-selected="true">resource.service.name</div>';
+    const state = getPageState();
+    const row = state.elements.find((e) => e.attrs.role === 'treeitem');
+    expect(row).toBeDefined();
+    expect(row.attrs['aria-selected']).toBe('true');
+  });
+
+  test('test_noninteractive_grid_row_does_not_swallow_trace_link', () => {
+    document.body.innerHTML =
+      '<div role="grid">' +
+      '<div role="row" aria-rowindex="2">' +
+      '<div role="gridcell">ramcore</div>' +
+      '<div role="gridcell"><a href="/explore?trace=abc" title="Open in new tab">http get /api/v1/projects/{projectId}/status</a></div>' +
+      '</div>' +
+      '</div>';
+    const state = getPageState();
+    expect(state.elements.some((e) => e.attrs.role === 'row')).toBe(false);
+    const trace = state.elements.find((e) => e.tag === 'a' && e.text.includes('/projects/{projectId}/status'));
+    expect(trace).toBeDefined();
+    expect(trace.attrs.title).toBe('Open in new tab');
+  });
+
+  test('test_pointer_events_none_wrapper_still_recurses_to_clickable_child', () => {
+    document.body.innerHTML = '<div class="wrapper"><a href="/trace/1">Open trace</a></div>';
+    jest.spyOn(window, 'getComputedStyle').mockImplementation((el) => ({
+      display: 'block',
+      visibility: 'visible',
+      pointerEvents: el.className === 'wrapper' ? 'none' : 'auto',
+      cursor: 'default',
+      overflowY: 'visible',
+      overflowX: 'visible',
+    }));
+    const state = getPageState();
+    const link = state.elements.find((e) => e.text === 'Open trace');
+    expect(link).toBeDefined();
+    expect(link.attrs.href).toBe('/trace/1');
+  });
+
+  test('test_standalone_grafana_info_icon_is_extracted_even_when_aria_hidden', () => {
+    document.body.innerHTML = '<svg data-testid="icon-info-circle" aria-hidden="true"></svg>';
+    jest.spyOn(SVGElement.prototype, 'getBoundingClientRect').mockReturnValue({ ...VISIBLE_RECT });
+    const state = getPageState();
+    const icon = state.elements.find((e) => e.tag === 'svg');
+    expect(icon).toBeDefined();
+    expect(icon.attrs['data-testid']).toBe('icon-info-circle');
+    expect(icon.text).toBe('icon-info-circle');
+  });
+
 });

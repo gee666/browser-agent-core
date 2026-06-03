@@ -10,14 +10,17 @@
   ];
 
   var INTERACTIVE_ROLES = [
-    'button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'switch',
-    'combobox', 'textbox', 'option', 'searchbox', 'slider', 'spinbutton',
+    'button', 'link', 'checkbox', 'radio', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'tab', 'switch', 'combobox', 'textbox', 'option',
+    'searchbox', 'slider', 'spinbutton', 'treeitem',
   ];
 
   var COLLECT_ATTRS = [
-    'type', 'placeholder', 'name', 'role', 'aria-label', 'aria-expanded',
-    'aria-checked', 'aria-haspopup', 'checked', 'value', 'alt', 'title',
-    'href', 'for', 'data-state', 'contenteditable',
+    'id', 'type', 'placeholder', 'name', 'role', 'aria-label', 'aria-labelledby',
+    'aria-describedby', 'aria-expanded', 'aria-selected', 'aria-current',
+    'aria-checked', 'aria-haspopup', 'aria-controls', 'aria-readonly',
+    'checked', 'value', 'alt', 'title', 'href', 'for', 'data-state',
+    'data-testid', 'data-test-id', 'data-cy', 'tabindex', 'contenteditable',
   ];
 
   // Module-level WeakSet tracking elements seen in the previous extraction.
@@ -46,11 +49,17 @@
 
   // ── 2. isVisible ─────────────────────────────────────────────────────────
 
-  function isVisible(el) {
+  function isSubtreeVisible(el) {
     if (!el || !el.isConnected) return false;
+    var style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
+  function isVisible(el) {
+    if (!isSubtreeVisible(el)) return false;
     if (el.disabled) return false;
     var style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+    if (style.pointerEvents === 'none') return false;
     var rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   }
@@ -74,14 +83,26 @@
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
+  function isPotentialStandaloneIcon(el) {
+    if (!el || String(el.tagName).toUpperCase() !== 'SVG') return false;
+    var testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-cy') || '';
+    var label = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+    var name = (testId + ' ' + label).toLowerCase();
+    return /\b(info|question|help)\b/.test(name) || /icon-(info|question|help)/.test(name);
+  }
+
   function shouldSkip(el) {
     if (el.getAttribute('data-page-agent-ignore') === 'true') return true;
-    if (el.getAttribute('aria-hidden') === 'true') return true;
+    if (el.getAttribute('aria-hidden') === 'true' && !isPotentialStandaloneIcon(el)) return true;
+    if (el.getAttribute('aria-disabled') === 'true') return true;
+    if (String(el.tagName).toUpperCase() === 'SVG' && isPotentialStandaloneIcon(el)) return false;
     return SKIP_TAGS.indexOf(el.tagName) !== -1;
   }
 
   function isInteractiveEl(el) {
     var tag = el.tagName;
+
+    if (String(tag).toUpperCase() === 'SVG' && isPotentialStandaloneIcon(el)) return true;
 
     // Tag-based checks
     if (tag === 'A' && el.hasAttribute('href')) return true;
@@ -96,7 +117,34 @@
     if (role && INTERACTIVE_ROLES.indexOf(role) !== -1) return true;
 
     // contenteditable
-    if (el.getAttribute('contenteditable') === 'true') return true;
+    if (el.getAttribute('contenteditable') === 'true' ||
+        el.getAttribute('contenteditable') === 'plaintext-only') return true;
+
+    // Keyboard-focusable custom controls. React/Grafana often implement
+    // select values, menu entries, virtualized rows, and command-palette
+    // triggers as div/span elements with tabindex instead of native controls.
+    // Treat non-negative tabindex as interactive, but ignore anonymous focus
+    // sentinels/containers that have no user-facing name, role, or text.
+    var tabindex = el.getAttribute('tabindex');
+    if (tabindex !== null && /^-?\d+$/.test(tabindex) && parseInt(tabindex, 10) >= 0) {
+      var hasInteractiveChild = false;
+      try {
+        hasInteractiveChild = !!el.querySelector('a[href],button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="checkbox"],[role="radio"],[role="combobox"],[contenteditable="true"],[contenteditable="plaintext-only"]');
+      } catch (_) { /* ignore */ }
+
+      var ariaFocusName = el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || '';
+      var testFocusName = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-cy') || '';
+      if (role) return true;
+      if (ariaFocusName.replace(/\s+/g, '').length > 0) return true;
+      if (testFocusName.replace(/\s+/g, '').length > 0 && !hasInteractiveChild) return true;
+
+      // Plain tabindex is also useful for custom rows/options, but large focus
+      // containers (Grafana side nav, panel wrappers, focus traps) often wrap
+      // many real child controls. Do not swallow those descendants as one giant
+      // element.
+      var focusText = ((typeof el.innerText === 'string' ? el.innerText : el.textContent) || '').replace(/\s+/g, ' ').trim();
+      if (focusText && focusText.length <= 120 && !hasInteractiveChild) return true;
+    }
 
     // CSS cursor
     try {
@@ -105,6 +153,51 @@
     } catch (e) { /* ignore */ }
 
     return false;
+  }
+
+  function textFromIdRefs(value) {
+    if (!value) return '';
+    var parts = value.split(/\s+/);
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var id = parts[i];
+      if (!id) continue;
+      try {
+        var ref = document.getElementById(id);
+        if (ref) out.push(((typeof ref.innerText === 'string' ? ref.innerText : ref.textContent) || '').replace(/\s+/g, ' ').trim());
+      } catch (_) { /* ignore invalid ids */ }
+    }
+    return out.filter(Boolean).join(' ');
+  }
+
+  function getAccessibleFallbackText(el) {
+    var candidates = [
+      el.getAttribute('aria-label'),
+      textFromIdRefs(el.getAttribute('aria-labelledby')),
+      el.getAttribute('title'),
+      el.getAttribute('placeholder'),
+      el.getAttribute('alt'),
+      el.getAttribute('data-testid'),
+      el.getAttribute('data-test-id'),
+      el.getAttribute('data-cy'),
+    ];
+
+    // Grafana and other React apps frequently render icon-only buttons where
+    // the useful name is on a child svg's data-testid (for example
+    // icon-sync/RefreshPicker run button). Include it as a last-resort label so
+    // the agent can distinguish blank-looking controls in the extractor output.
+    try {
+      var icon = el.querySelector('[data-testid], [data-test-id], [data-cy]');
+      if (icon) {
+        candidates.push(icon.getAttribute('data-testid') || icon.getAttribute('data-test-id') || icon.getAttribute('data-cy'));
+      }
+    } catch (_) { /* ignore */ }
+
+    for (var i = 0; i < candidates.length; i++) {
+      var c = candidates[i];
+      if (c) return String(c).replace(/^data-testid\s*/i, '').replace(/\s+/g, ' ').trim();
+    }
+    return '';
   }
 
   // ── 5. DOM tree walk ──────────────────────────────────────────────────────
@@ -126,7 +219,7 @@
       var attrName = COLLECT_ATTRS[j];
       var val = el.getAttribute(attrName);
       if (val !== null && val !== '') {
-        attrs[attrName] = val.slice(0, 40);
+        attrs[attrName] = val.slice(0, 80);
       }
     }
 
@@ -188,6 +281,10 @@
       currentValue = currentValue.replace(/\s+/g, ' ').trim().slice(0, 500);
     }
 
+    if (!text) {
+      text = getAccessibleFallbackText(el).slice(0, 80);
+    }
+
     return {
       index: index,
       tag: el.tagName.toLowerCase(),
@@ -210,9 +307,9 @@
   // Process a single element node (called from walkNode).
   function processElement(el, depth, state) {
     if (shouldSkip(el)) return;
-    if (!isVisible(el)) return;
+    if (!isSubtreeVisible(el)) return;
 
-    if (isInteractiveEl(el)) {
+    if (isInteractiveEl(el) && isVisible(el)) {
       var info = buildElementInfo(el, depth, state.nextIndex++);
       state.elements.push(info);
       state.lines.push({ type: 'element', depth: depth, element: info });
@@ -224,7 +321,11 @@
       // inherits cursor:pointer and would otherwise get its own index).
       // Full text content is already captured via innerText above.
     } else {
-      // Pass-through: non-interactive container, recurse at same depth
+      // Pass-through: non-interactive or non-clickable containers still need
+      // recursion. Grafana/React Data Grid often puts useful links/buttons
+      // inside wrappers with pointer-events:none, zero-sized measuring cells,
+      // or non-interactive ARIA grid rows; pruning the whole subtree here hides
+      // trace rows, attribute filters, and open-in-new-tab links.
       walkNode(el, depth, state);
     }
   }

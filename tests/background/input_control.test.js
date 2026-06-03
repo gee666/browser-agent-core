@@ -22,6 +22,10 @@ beforeEach(() => {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 describe('InputControlBridge', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   test('test_connect_opens_native_port', async () => {
     const port = createMockPort();
     chrome.runtime.connectNative.mockReturnValue(port);
@@ -136,5 +140,31 @@ describe('InputControlBridge', () => {
     const [r1, r2] = await Promise.all([p1, p2]);
     expect(r1).toBeDefined();
     expect(r2).toBeDefined();
+  });
+
+  test('test_timeout_disconnects_stuck_native_host_and_next_execute_reconnects', async () => {
+    jest.useFakeTimers();
+    const port1 = createMockPort();
+    const port2 = createMockPort();
+    chrome.runtime.connectNative
+      .mockReturnValueOnce(port1)
+      .mockReturnValueOnce(port2);
+
+    const bridge = new InputControlBridge();
+    const p1 = bridge.execute('mouse_move', { x: 1, y: 2, timeout_ms: 5 }, {});
+    await Promise.resolve();
+
+    jest.advanceTimersByTime(6);
+    await expect(p1).rejects.toBeInstanceOf(InputControlTimeoutError);
+    expect(port1.disconnect).toHaveBeenCalledTimes(1);
+
+    const p2 = bridge.execute('mouse_click', { x: 1, y: 2, timeout_ms: 100 }, {});
+    await Promise.resolve();
+    expect(chrome.runtime.connectNative).toHaveBeenCalledTimes(2);
+    expect(port2.postMessage).toHaveBeenCalledWith(expect.objectContaining({ command: 'mouse_click' }));
+
+    const sentId = port2.postMessage.mock.calls[0][0].id;
+    port2._emit('message', { id: sentId, status: 'ok' });
+    await expect(p2).resolves.toBeDefined();
   });
 });
