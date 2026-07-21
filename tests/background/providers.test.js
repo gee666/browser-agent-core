@@ -4,6 +4,7 @@ import { AnthropicProvider } from '../../background/llm/anthropic.js';
 import { OllamaProvider } from '../../background/llm/ollama.js';
 import { OpenRouterProvider } from '../../background/llm/openrouter.js';
 import { NvidiaProvider } from '../../background/llm/nvidia.js';
+import { buildCodexBody, OpenAICodexOAuthProvider } from '../../background/llm/openai-oauth.js';
 import { LLMError } from '../../background/llm/utils.js';
 
 // ── shared helpers ────────────────────────────────────────────────────────────
@@ -92,6 +93,28 @@ describe('OpenAIProvider', () => {
     await expect(
       p.complete({ system: 's', messages: [{ role: 'user', content: 'hi' }], screenshot: null }),
     ).rejects.toThrow(LLMError);
+  });
+});
+
+// ── OpenAI OAuth ──────────────────────────────────────────────────────────────
+
+describe('OpenAICodexOAuthProvider', () => {
+  test('includes the selected reasoning effort in Codex requests', () => {
+    const body = buildCodexBody(
+      'gpt-5.6-sol',
+      'system',
+      [{ role: 'user', content: 'hello' }],
+      null,
+      'high',
+    );
+
+    expect(body.model).toBe('gpt-5.6-sol');
+    expect(body.reasoning).toEqual({ effort: 'high' });
+  });
+
+  test('defaults invalid reasoning levels to medium', () => {
+    const provider = new OpenAICodexOAuthProvider({ reasoningLevel: 'invalid' });
+    expect(provider._reasoningLevel).toBe('medium');
   });
 });
 

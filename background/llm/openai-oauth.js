@@ -8,6 +8,7 @@ const TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const REDIRECT_URI = 'http://localhost:1455/auth/callback';
 const SCOPE = 'openid profile email offline_access';
 const PROVIDER_KEY = 'openai-codex';
+const REASONING_LEVELS = new Set(['low', 'medium', 'high', 'xhigh']);
 
 /**
  * Build the OpenAI Codex authorization URL.
@@ -92,7 +93,7 @@ const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
  * Build the Codex SSE request body.
  * Uses the OpenAI Responses API format (input array, not messages).
  */
-function buildCodexBody(model, system, messages, screenshot) {
+export function buildCodexBody(model, system, messages, screenshot, reasoningLevel = 'medium') {
   const input = [];
   const lastUserIdx = [...messages].map(m => m.role).lastIndexOf('user');
 
@@ -128,6 +129,7 @@ function buildCodexBody(model, system, messages, screenshot) {
     instructions: system,
     input,
     text: { verbosity: 'medium' },
+    reasoning: { effort: reasoningLevel },
     include: ['reasoning.encrypted_content'],
   };
 }
@@ -191,9 +193,10 @@ async function parseCodexSSE(response) {
  * is a ChatGPT subscription token and requires the chatgpt-account-id header.
  */
 export class OpenAICodexOAuthProvider extends LLMProvider {
-  constructor({ model = 'gpt-5.1' } = {}) {
+  constructor({ model = 'gpt-5.6-sol', reasoningLevel = 'medium' } = {}) {
     super();
     this._model = model;
+    this._reasoningLevel = REASONING_LEVELS.has(reasoningLevel) ? reasoningLevel : 'medium';
   }
 
   async complete({ system, messages, screenshot }) {
@@ -203,7 +206,7 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
     const { access, accountId } = tokens;
     if (!accountId) throw new OAuthError('Missing accountId in stored OpenAI token. Please re-login.');
 
-    const body = buildCodexBody(this._model, system, messages, screenshot);
+    const body = buildCodexBody(this._model, system, messages, screenshot, this._reasoningLevel);
 
     const response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
       method: 'POST',
