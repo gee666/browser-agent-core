@@ -91,7 +91,7 @@ export class AnthropicOAuthProvider extends LLMProvider {
     this._temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const tokens = await getValidTokens(PROVIDER_KEY, (rt) => refreshAnthropicToken(rt));
     await storeTokens(PROVIDER_KEY, tokens);
 
@@ -136,6 +136,7 @@ export class AnthropicOAuthProvider extends LLMProvider {
     // not as Bearer tokens. The Authorization header is not supported.
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
+      signal,
       headers: {
         'x-api-key': tokens.access,
         'anthropic-version': '2023-06-01',

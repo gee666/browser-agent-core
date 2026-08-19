@@ -38,6 +38,7 @@ beforeEach(() => {
     scrollToPosition:         jest.fn().mockResolvedValue(undefined),
     scrollElementIntoView:    jest.fn().mockResolvedValue(true),
     focusElement:             jest.fn().mockResolvedValue(true),
+    suppressContextMenuOnce:  jest.fn().mockResolvedValue(true),
     getElementValue:          jest.fn().mockResolvedValue('hello'), // default: matches typed text
   };
   mockInputControl = { execute: jest.fn().mockResolvedValue(undefined) };
@@ -270,12 +271,7 @@ describe('ActionExecutor v2', () => {
     expect(typeCalls).toHaveLength(1);
   });
 
-  // _executeType: retries once when first attempt value is empty
-  test('test_type_retries_when_value_empty', async () => {
-    // _readTypedValueForVerification retries the read up to 4 times with
-    // increasing delays before bubbling up. To force a top-level type retry,
-    // return '' for the entire first verification window and then return the
-    // matching value on the next attempt.
+  test('test_type_retries_once_when_readable_field_is_empty', async () => {
     mockBridge.getElementValue
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('')
@@ -285,17 +281,36 @@ describe('ActionExecutor v2', () => {
     const executor = makeExecutor();
     await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
       .resolves.not.toThrow();
-    // Two 'type' calls (original + retry)
     const typeCalls = mockInputControl.execute.mock.calls.filter(c => c[0] === 'type');
+    const deleteCalls = mockInputControl.execute.mock.calls.filter(c => c[0] === 'press_key' && c[1].key === 'Delete');
     expect(typeCalls).toHaveLength(2);
+    expect(deleteCalls).toHaveLength(2);
   });
 
-  // _executeType: throws ExecutorError after all attempts fail
-  test('test_type_throws_after_all_attempts_fail', async () => {
-    mockBridge.getElementValue.mockResolvedValue(''); // always empty
+  test('test_type_fails_after_two_verified_empty_attempts', async () => {
+    mockBridge.getElementValue.mockResolvedValue('');
     const executor = makeExecutor();
     await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
-      .rejects.toThrow(ExecutorError);
+      .rejects.toThrow(/after 2 attempts/);
+    expect(mockInputControl.execute.mock.calls.filter(c => c[0] === 'type')).toHaveLength(2);
+  });
+
+  test('test_type_retries_once_when_value_is_unavailable', async () => {
+    mockBridge.getElementValue.mockResolvedValue(null);
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState))
+      .rejects.toThrow(/value unavailable/);
+    expect(mockInputControl.execute.mock.calls.filter(c => c[0] === 'type')).toHaveLength(2);
+  });
+
+  test('test_sensitive_field_is_not_read_or_retried', async () => {
+    mockBridge.getElementValueResult = jest.fn().mockResolvedValue({
+      ok: false, value: null, reason: 'sensitive',
+    });
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'secret' } }, defaultPageState))
+      .resolves.not.toThrow();
+    expect(mockInputControl.execute.mock.calls.filter(c => c[0] === 'type')).toHaveLength(1);
   });
 
   // _typeSucceeded: null value is treated as failure (not positive confirmation).
@@ -316,6 +331,20 @@ describe('ActionExecutor v2', () => {
   test('test_typeSucceeded_empty_is_failure', () => {
     const executor = makeExecutor();
     expect(executor._typeSucceeded('', 'hello')).toBe(false);
+  });
+
+  test('test_typeSucceeded_accepts_common_site_formatting', () => {
+    const executor = makeExecutor();
+    expect(executor._typeSucceeded('(415) 555-0123', '4155550123')).toBe(true);
+    expect(executor._typeSucceeded('AMSTERDAM', 'Amsterdam')).toBe(true);
+  });
+
+  test('test_clicks_are_explicit_left_clicks_and_arm_context_menu_guard', async () => {
+    const executor = makeExecutor();
+    await executor.execute({ click: { index: 0 } }, defaultPageState);
+    expect(mockBridge.suppressContextMenuOnce).toHaveBeenCalledWith(1);
+    const click = inputCalls().find(c => c[0] === 'mouse_click');
+    expect(click[1]).toEqual(expect.objectContaining({ button: 'left', count: 1, hold_ms: 40 }));
   });
 
   // _typeSucceeded: long text partial match (first 50 chars match, >=80% length)

@@ -30,6 +30,29 @@
   // Populated on every getPageState() call so the executor can call
   // get_element_value message.
   var indexToElement = new Map();
+  var contextMenuGuardTimer = null;
+  var contextMenuGuard = null;
+
+  function suppressNextContextMenu(timeoutMs) {
+    if (contextMenuGuard) {
+      document.removeEventListener('contextmenu', contextMenuGuard, true);
+      clearTimeout(contextMenuGuardTimer);
+    }
+    contextMenuGuard = function (event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      document.removeEventListener('contextmenu', contextMenuGuard, true);
+      clearTimeout(contextMenuGuardTimer);
+      contextMenuGuard = null;
+      contextMenuGuardTimer = null;
+    };
+    document.addEventListener('contextmenu', contextMenuGuard, true);
+    contextMenuGuardTimer = setTimeout(function () {
+      if (contextMenuGuard) document.removeEventListener('contextmenu', contextMenuGuard, true);
+      contextMenuGuard = null;
+      contextMenuGuardTimer = null;
+    }, Math.max(100, Math.min(Number(timeoutMs) || 500, 1000)));
+  }
 
   // ── 1. getBrowserContext ──────────────────────────────────────────────────
 
@@ -51,8 +74,11 @@
 
   function isSubtreeVisible(el) {
     if (!el || !el.isConnected) return false;
-    var style = window.getComputedStyle(el);
-    return style.display !== 'none' && style.visibility !== 'hidden';
+    for (var node = el; node && node.nodeType === 1; node = node.parentElement) {
+      var style = window.getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+    }
+    return true;
   }
 
   function isVisible(el) {
@@ -200,6 +226,60 @@
     return '';
   }
 
+  function isEditableControl(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = String(el.tagName).toUpperCase();
+    if (tag === 'INPUT') {
+      var type = (el.getAttribute('type') || '').toLowerCase();
+      return type !== 'hidden' && type !== 'button' && type !== 'submit' &&
+        type !== 'reset' && type !== 'checkbox' && type !== 'radio' && type !== 'file';
+    }
+    if (tag === 'TEXTAREA') return true;
+    return !!el.isContentEditable || el.getAttribute('contenteditable') === 'true' ||
+      el.getAttribute('contenteditable') === 'plaintext-only';
+  }
+
+  // ARIA combobox/textbox widgets frequently put the role on a wrapper while
+  // the live value belongs to a nested input. The wrapper is the indexed and
+  // clicked element, so always resolve it to the control that actually owns
+  // the typed value before reporting or verifying that value.
+  function resolveEditableControl(el) {
+    if (isEditableControl(el)) return el;
+    if (!el || el.nodeType !== 1) return null;
+
+    var active = document.activeElement;
+    if (active && active !== el && el.contains(active) && isEditableControl(active)) {
+      return active;
+    }
+
+    var candidates;
+    try {
+      candidates = el.querySelectorAll(
+        'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable="plaintext-only"]'
+      );
+    } catch (_) {
+      return null;
+    }
+    for (var i = 0; i < candidates.length; i++) {
+      if (isEditableControl(candidates[i]) && isVisible(candidates[i])) return candidates[i];
+    }
+    return null;
+  }
+
+  function readEditableValue(el, allowSensitive) {
+    var control = resolveEditableControl(el);
+    if (!control) return null;
+    var tag = String(control.tagName).toUpperCase();
+    if (tag === 'INPUT') {
+      var type = (control.getAttribute('type') || '').toLowerCase();
+      if (!allowSensitive && type === 'password') return null;
+      return typeof control.value === 'string' ? control.value : '';
+    }
+    if (tag === 'TEXTAREA') return typeof control.value === 'string' ? control.value : '';
+    var text = (typeof control.innerText === 'string' ? control.innerText : '') || control.textContent || '';
+    return text;
+  }
+
   // ── 5. DOM tree walk ──────────────────────────────────────────────────────
 
   function buildElementInfo(el, depth, index) {
@@ -246,30 +326,20 @@
     var currentValue = '';
     try {
       var _tag = el.tagName;
-      if (_tag === 'INPUT') {
+      var editableValue = readEditableValue(el, false);
+      if (editableValue !== null) {
+        currentValue = editableValue;
+      } else if (_tag === 'INPUT') {
         var itype = (el.getAttribute('type') || '').toLowerCase();
-        // Password values must never leak into prompts/logs.
-        if (itype !== 'password' && itype !== 'hidden' && itype !== 'file') {
-          if (itype === 'checkbox' || itype === 'radio') {
-            currentValue = el.checked ? 'checked' : '';
-          } else {
-            currentValue = typeof el.value === 'string' ? el.value : '';
-          }
+        if (itype === 'checkbox' || itype === 'radio') {
+          currentValue = el.checked ? 'checked' : '';
         }
-      } else if (_tag === 'TEXTAREA') {
-        currentValue = typeof el.value === 'string' ? el.value : '';
       } else if (_tag === 'SELECT') {
         // Report the selected option's visible label, not its underlying value.
         var selOpt = el.options && el.options[el.selectedIndex];
         if (selOpt) {
           currentValue = (selOpt.textContent || selOpt.value || '').replace(/\s+/g, ' ').trim();
         }
-      } else if (el.getAttribute('contenteditable') === 'true' ||
-                 el.getAttribute('contenteditable') === 'plaintext-only') {
-        // For rich-text compose surfaces (Gmail, Slack, etc.) prefer innerText
-        // so the rendered, human-visible content wins over raw HTML.
-        var _ct = (typeof el.innerText === 'string' ? el.innerText : '') || el.textContent || '';
-        currentValue = _ct;
       }
     } catch (_) {
       currentValue = '';
@@ -480,18 +550,51 @@
       });
       return true;
     }
+    if (message.type === 'suppress_context_menu_once') {
+      suppressNextContextMenu(message.timeoutMs);
+      sendResponse({ ok: true });
+      return true;
+    }
+    if (message.type === 'focus_element') {
+      var fel = indexToElement.get(message.index);
+      var control = fel && fel.isConnected ? (resolveEditableControl(fel) || fel) : null;
+      if (!control || typeof control.focus !== 'function') {
+        sendResponse({ ok: false });
+      } else {
+        try {
+          control.focus({ preventScroll: true });
+          sendResponse({ ok: document.activeElement === control });
+        } catch (_) {
+          sendResponse({ ok: false });
+        }
+      }
+      return true;
+    }
     if (message.type === 'get_element_value') {
       var vel = indexToElement.get(message.index);
+      // React editors may replace the indexed wrapper while preserving focus
+      // on the replacement control. Prefer that live focused control rather
+      // than declaring the value unreadable or rebuilding unstable indices.
       if (!vel || !vel.isConnected) {
+        vel = isEditableControl(document.activeElement) ? document.activeElement : null;
+      }
+      if (!vel) {
         sendResponse({ ok: false, value: null, reason: 'not found' });
       } else {
-        // inputs/textareas expose .value; contenteditable editors often surface
-        // the live user-visible text more reliably via innerText than textContent.
-        var isContentEditable = !!vel.isContentEditable || vel.getAttribute('contenteditable') === 'true';
-        var val = ('value' in vel)
-          ? vel.value
-          : (isContentEditable ? (vel.innerText || vel.textContent || '') : (vel.textContent || vel.innerText || ''));
-        sendResponse({ ok: true, value: typeof val === 'string' ? val.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '') : val });
+        var liveControl = resolveEditableControl(vel);
+        var liveType = liveControl && String(liveControl.tagName).toUpperCase() === 'INPUT'
+          ? (liveControl.getAttribute('type') || '').toLowerCase()
+          : '';
+        if (liveType === 'password') {
+          sendResponse({ ok: false, value: null, reason: 'sensitive' });
+        } else {
+          var val = readEditableValue(vel, false);
+          if (val === null) {
+            sendResponse({ ok: false, value: null, reason: 'value unavailable' });
+          } else {
+            sendResponse({ ok: true, value: typeof val === 'string' ? val.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '') : val });
+          }
+        }
       }
       return true;
     }

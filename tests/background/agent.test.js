@@ -220,10 +220,16 @@ describe('AgentCore', () => {
       await Promise.resolve();
     }
     agent.stop();
-    resolveLLM(makeClickResponse(0));
 
+    // Cancellation must settle without waiting for the provider request to
+    // finish. The old implementation stayed blocked until resolveLLM ran.
     const result = await runPromise;
     expect(result).toBeNull();
+    expect(executor.execute).not.toHaveBeenCalled();
+
+    // A late provider response must not resume browser actions.
+    resolveLLM(makeClickResponse(0));
+    await Promise.resolve();
     expect(executor.execute).not.toHaveBeenCalled();
   });
 

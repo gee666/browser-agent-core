@@ -207,7 +207,7 @@ export class GeminiOAuthProvider extends LLMProvider {
     this._temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const tokens = await getValidTokens(PROVIDER_KEY, (rt, prev) => refreshGeminiToken(rt, prev));
     await storeTokens(PROVIDER_KEY, tokens);
 
@@ -263,6 +263,7 @@ export class GeminiOAuthProvider extends LLMProvider {
 
     const response = await fetch(`${CODE_ASSIST_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`, {
       method: 'POST',
+      signal,
       headers,
       body: JSON.stringify(requestBody),
     });

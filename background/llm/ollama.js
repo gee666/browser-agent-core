@@ -13,7 +13,7 @@ export class OllamaProvider extends LLMProvider {
     this.temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const builtMessages = [
       { role: 'system', content: system },
       ...messages,
@@ -34,6 +34,7 @@ export class OllamaProvider extends LLMProvider {
 
     const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: 'POST',
+      signal,
       headers: {
         'Content-Type': 'application/json',
       },

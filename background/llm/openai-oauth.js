@@ -199,7 +199,7 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
     this._reasoningLevel = REASONING_LEVELS.has(reasoningLevel) ? reasoningLevel : 'medium';
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const tokens = await getValidTokens(PROVIDER_KEY, (rt) => refreshOpenAIToken(rt));
     await storeTokens(PROVIDER_KEY, tokens);
 
@@ -210,6 +210,7 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
 
     const response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
       method: 'POST',
+      signal,
       headers: {
         'Authorization': `Bearer ${access}`,
         'chatgpt-account-id': accountId,

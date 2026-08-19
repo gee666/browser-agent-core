@@ -20,7 +20,7 @@ export class NvidiaProvider extends LLMProvider {
     this.temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const builtMessages = [
       { role: 'system', content: system },
       ...messages,
@@ -42,6 +42,7 @@ export class NvidiaProvider extends LLMProvider {
 
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
+      signal,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',

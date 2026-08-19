@@ -18,7 +18,7 @@ export class OpenRouterProvider extends LLMProvider {
     this.temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     const builtMessages = [
       { role: 'system', content: system },
       ...messages,
@@ -40,6 +40,7 @@ export class OpenRouterProvider extends LLMProvider {
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
+      signal,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'HTTP-Referer': 'browser-agent-core',
