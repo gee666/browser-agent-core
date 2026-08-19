@@ -52,6 +52,7 @@ export class AgentCore {
     this._sessionId = null;
     this._turnCounter = 0;
     this._pendingSteers = [];
+    this._abortController = null;
   }
 
   /** Queue a user follow-up/steer to be included in the next LLM turn. */
@@ -64,9 +65,10 @@ export class AgentCore {
     return true;
   }
 
-  /** Signal the running loop to stop after the current iteration. */
+  /** Signal the running loop to stop immediately. */
   stop() {
     this._stopped = true;
+    this._abortController?.abort();
   }
 
   _status(extra) {
@@ -84,17 +86,70 @@ export class AgentCore {
     this._bridge.sendStatus(s);
   }
 
+  _abortError() {
+    const error = new Error('Browser task stopped');
+    error.name = 'AbortError';
+    return error;
+  }
+
+  _awaitAbortable(value) {
+    const signal = this._abortController?.signal;
+    if (!signal) return Promise.resolve(value);
+    if (signal.aborted) return Promise.reject(this._abortError());
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(this._abortError());
+      signal.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve(value).then(
+        (result) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(result);
+        },
+        (error) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
   _sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
+    return this._awaitAbortable(new Promise(r => setTimeout(r, ms)));
+  }
+
+  /** Run the agent loop. All long awaits race the run's cancellation signal. */
+  async run(task, { signal = null } = {}) {
+    this._stopped = false;
+    const controller = new AbortController();
+    this._abortController = controller;
+    const onExternalAbort = () => {
+      this._stopped = true;
+      controller.abort();
+    };
+    if (signal) {
+      if (signal.aborted) onExternalAbort();
+      else signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    try {
+      return await this._run(task);
+    } catch (error) {
+      if (this._stopped || controller.signal.aborted || error?.name === 'AbortError') {
+        this._stopped = true;
+        this._status({ state: 'stopped', message: 'Task stopped' });
+        return null;
+      }
+      throw error;
+    } finally {
+      if (signal) signal.removeEventListener('abort', onExternalAbort);
+      if (this._abortController === controller) this._abortController = null;
+    }
   }
 
   /**
-   * Run the agent loop for the given task.
    * @param {string} task
    * @returns {Promise<string|null>} The done message from the LLM, or null.
    */
-  async run(task) {
-    this._stopped = false;
+  async _run(task) {
     this._task = task;
     this._iteration = 0;
     this._url = null;
@@ -115,8 +170,8 @@ export class AgentCore {
     // If the task contains a URL, navigate there first.
     const urlMatch = /https?:\/\/[^\s]+/.exec(task);
     if (urlMatch) {
-      await this._bridge.navigate(urlMatch[0]);
-      await this._bridge.waitForPageSettle();
+      await this._awaitAbortable(this._bridge.navigate(urlMatch[0]));
+      await this._awaitAbortable(this._bridge.waitForPageSettle());
     }
 
     for (let stepNum = 0; stepNum < this._maxIterations; stepNum++) {
@@ -127,14 +182,15 @@ export class AgentCore {
         return null;
       }
 
-      const tabId = await this._bridge.getActiveTabId();
-      const pageState = await this._bridge.getPageState(tabId);
+      const tabId = await this._awaitAbortable(this._bridge.getActiveTabId());
+      const pageState = await this._awaitAbortable(this._bridge.getPageState(tabId));
       this._url = pageState.url;
       this._title = pageState.title;
 
       let screenshot = null;
       if (this._useVision) {
-        screenshot = await this._compressScreenshot(await this._bridge.takeScreenshot(), pageState);
+        const rawScreenshot = await this._awaitAbortable(this._bridge.takeScreenshot());
+        screenshot = await this._awaitAbortable(this._compressScreenshot(rawScreenshot, pageState));
       }
 
       this._status({ state: 'thinking', message: 'Reading the page and deciding the next browser action.' });
@@ -255,7 +311,8 @@ export class AgentCore {
         // Take a fresh screenshot for verification (if vision enabled)
         let verifyShot = null;
         if (this._useVision) {
-          verifyShot = await this._compressScreenshot(await this._bridge.takeScreenshot());
+          const rawVerifyShot = await this._awaitAbortable(this._bridge.takeScreenshot());
+          verifyShot = await this._awaitAbortable(this._compressScreenshot(rawVerifyShot));
         }
         const verifyResult = await this._verifyDone(task, action.done, pageState, verifyShot);
         if (verifyResult.verified) {
@@ -273,7 +330,7 @@ export class AgentCore {
       this._status({ state: 'acting', actionsCount: 1, message: this._describeAction(action), plannedAction: action });
 
       try {
-        await this._executor.execute(action, pageState);
+        await this._awaitAbortable(this._executor.execute(action, pageState));
         // If stop() was called while the executor was running, abort cleanly now.
         if (this._stopped) {
           this._status({ state: 'stopped' });
@@ -286,8 +343,8 @@ export class AgentCore {
         histEntry.actionResult = `Executed ${actionName}: ${JSON.stringify(actionParams)}`;
         this._status({ state: 'running', message: histEntry.actionResult, lastAction: histEntry.actionResult });
         // Wait for any triggered navigation or DOM update to settle.
-        const tabId2 = await this._bridge.getActiveTabId();
-        await this._bridge.waitForPageSettle(tabId2, 1500);
+        const tabId2 = await this._awaitAbortable(this._bridge.getActiveTabId());
+        await this._awaitAbortable(this._bridge.waitForPageSettle(tabId2, 1500));
         // ── Loop detection ───────────────────────────────────────────────
         // Track (url, serialised-action) pairs to spot cycles of length 1, 2, or 3.
         const actionStr = JSON.stringify(action);
@@ -603,6 +660,7 @@ export class AgentCore {
         { stepNum: this._iteration, turnType: 'verify' }
       );
     } catch (err) {
+      if (this._stopped || err?.name === 'AbortError') throw err;
       // Fail-closed by default: a verification outage must NOT masquerade as
       // a verified completion. Surface the failure as "unverified" so the
       // agent retries. Embedders can opt into legacy fail-open via the
@@ -660,7 +718,10 @@ export class AgentCore {
    * @returns {Promise<string>}
    */
   async _llmComplete(params, { stepNum, turnType }) {
-    const response = await this._llm.complete(params);
+    const response = await this._awaitAbortable(this._llm.complete({
+      ...params,
+      signal: this._abortController?.signal,
+    }));
     if (this._debugLog) {
       this._turnCounter++;
       try {

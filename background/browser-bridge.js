@@ -201,13 +201,47 @@ export class BrowserBridge {
    * @param {number} index
    * @returns {Promise<string|null>}
    */
-  async getElementValue(tabId, index) {
+  async getElementValueResult(tabId, index) {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(null), 2000);
+      const timer = setTimeout(() => resolve({ ok: false, value: null, reason: 'timeout' }), 2000);
       chrome.tabs.sendMessage(tabId, { type: 'get_element_value', index }, (response) => {
         clearTimeout(timer);
         void chrome.runtime.lastError;
-        resolve(response?.ok ? (response.value ?? '') : null);
+        resolve(response && typeof response === 'object'
+          ? response
+          : { ok: false, value: null, reason: 'no response' });
+      });
+    });
+  }
+
+  async getElementValue(tabId, index) {
+    const response = await this.getElementValueResult(tabId, index);
+    return response?.ok ? (response.value ?? '') : null;
+  }
+
+  /** Prevent one accidental native context menu during an automation click. */
+  async suppressContextMenuOnce(tabId, timeoutMs = 500) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 1000);
+      chrome.tabs.sendMessage(tabId, {
+        type: 'suppress_context_menu_once',
+        timeoutMs,
+      }, (response) => {
+        clearTimeout(timer);
+        void chrome.runtime.lastError;
+        resolve(response?.ok === true);
+      });
+    });
+  }
+
+  /** Focus the effective editable control for an indexed element/wrapper. */
+  async focusElement(tabId, index) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 1000);
+      chrome.tabs.sendMessage(tabId, { type: 'focus_element', index }, (response) => {
+        clearTimeout(timer);
+        void chrome.runtime.lastError;
+        resolve(response?.ok === true);
       });
     });
   }

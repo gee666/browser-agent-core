@@ -63,6 +63,12 @@ function getPageState() {
   return response;
 }
 
+function getElementValue(index) {
+  let response;
+  messageHandler({ type: 'get_element_value', index }, {}, (r) => { response = r; });
+  return response;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 describe('extractor', () => {
@@ -198,6 +204,20 @@ describe('extractor', () => {
     expect(elements[2].index).toBe(2);
   });
 
+  test('test_context_menu_guard_prevents_only_the_next_context_menu', () => {
+    let response;
+    messageHandler({ type: 'suppress_context_menu_once', timeoutMs: 1200 }, {}, (r) => { response = r; });
+    expect(response).toEqual({ ok: true });
+
+    const first = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(first);
+    expect(first.defaultPrevented).toBe(true);
+
+    const second = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(second);
+    expect(second.defaultPrevented).toBe(false);
+  });
+
   // 12. wait_for_settle message resolves with { settled: true }
   test('test_wait_for_settle_resolves', async () => {
     let settled = null;
@@ -237,6 +257,47 @@ describe('extractor', () => {
     expect(input).toBeDefined();
     expect(input.currentValue).toBe('');
     expect(state.domText).not.toContain('hunter2');
+    expect(getElementValue(input.index)).toEqual({ ok: false, value: null, reason: 'sensitive' });
+  });
+
+  test('test_aria_combobox_wrapper_reads_nested_input_value', () => {
+    document.body.innerHTML =
+      '<div role="combobox" aria-label="City"><input type="text" /></div>';
+    document.querySelector('input').value = 'Amsterdam';
+
+    const state = getPageState();
+    const wrapper = state.elements.find((e) => e.attrs.role === 'combobox');
+    expect(wrapper).toBeDefined();
+    expect(wrapper.currentValue).toBe('Amsterdam');
+    expect(state.domText).toContain('current-value="Amsterdam"');
+    expect(getElementValue(wrapper.index)).toEqual({ ok: true, value: 'Amsterdam' });
+
+    let focusResponse;
+    messageHandler({ type: 'focus_element', index: wrapper.index }, {}, (r) => { focusResponse = r; });
+    expect(focusResponse).toEqual({ ok: true });
+    expect(document.activeElement).toBe(document.querySelector('input'));
+  });
+
+  test('test_hidden_nested_control_is_not_used_for_wrapper_value', () => {
+    document.body.innerHTML =
+      '<div role="combobox"><span style="display:none"><input value="hidden"></span><input value="visible"></div>';
+    const state = getPageState();
+    const wrapper = state.elements.find((e) => e.attrs.role === 'combobox');
+    expect(wrapper.currentValue).toBe('visible');
+    expect(getElementValue(wrapper.index)).toEqual({ ok: true, value: 'visible' });
+  });
+
+  test('test_focused_editable_descendant_wins_inside_composite_wrapper', () => {
+    document.body.innerHTML =
+      '<div role="textbox"><input value="first"><textarea>second</textarea></div>';
+    const textarea = document.querySelector('textarea');
+    textarea.value = 'focused value';
+    textarea.focus();
+
+    const state = getPageState();
+    const wrapper = state.elements.find((e) => e.attrs.role === 'textbox');
+    expect(wrapper.currentValue).toBe('focused value');
+    expect(getElementValue(wrapper.index)).toEqual({ ok: true, value: 'focused value' });
   });
 
   // The root cause of the Gmail-reply verification failure: the label slice

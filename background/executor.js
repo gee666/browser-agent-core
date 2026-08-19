@@ -54,7 +54,8 @@ export class ActionExecutor {
     const ctx = freshState.context;
     await this._inputControl.execute('mouse_move', { x, y, duration_ms: 350 + this._rand(0, 150) }, ctx);
     await this._sleep(80 + this._rand(0, 60));
-    await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1 }, ctx);
+    await this._suppressUnexpectedContextMenu(await this._bridge.getActiveTabId());
+    await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1, hold_ms: 40 }, ctx);
     await this._sleep(100 + this._rand(0, 100));
   }
 
@@ -63,57 +64,55 @@ export class ActionExecutor {
     const MAX_TYPE_ATTEMPTS = 2;
 
     for (let attempt = 0; attempt < MAX_TYPE_ATTEMPTS; attempt++) {
-      // Re-fetch state on retry so we have fresh coords and context.
-      if (attempt > 0) {
-        await this._sleep(300);
-        pageState = await this._bridge.getPageState(tabId);
-      }
-
       const { x, y, pageState: freshState } = await this._getValidatedCoords(index, pageState);
       const ctx = freshState.context;
 
-      // 1. Native click to position the cursor.
+      // Native click positions the cursor. If supported, DOM focus resolves an
+      // indexed ARIA wrapper to its actual editable descendant before Ctrl+A.
       await this._inputControl.execute('mouse_move', { x, y, duration_ms: 350 + this._rand(0, 150) }, ctx);
       await this._sleep(80 + this._rand(0, 60));
-      await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1 }, ctx);
+      await this._suppressUnexpectedContextMenu(tabId);
+      await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1, hold_ms: 40 }, ctx);
       await this._sleep(150);
-
-      // 1b. If supported by the bridge, focus the element before Ctrl+A so the
-      // shortcut targets it reliably. Real input still goes through inputControl.
       if (typeof this._bridge.focusElement === 'function') {
         await this._bridge.focusElement(tabId, index);
         await this._sleep(80);
       }
 
-      // 2. Select all existing content inside the element and delete it.
       await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, ctx);
       await this._sleep(80);
       await this._inputControl.execute('press_key', { key: 'Delete' }, ctx);
       await this._sleep(80);
-
-      // 4. Type the new text.
       await this._inputControl.execute('type', { text, wpm: 55 + this._rand(0, 15) }, ctx);
       await this._sleep(200);
 
-      // 5. Verify: read back the element value and compare to what was typed.
-      // Some rich-text editors (e.g. Gmail compose) update the DOM asynchronously
-      // or replace the focused node after the first keystroke, so do a short
-      // verification window before deciding the attempt failed.
-      const actual = await this._readTypedValueForVerification(tabId, index, text);
-      if (this._typeSucceeded(actual, text)) return; // ✓
+      const verification = await this._readTypedValueForVerification(tabId, index, text);
+      const actual = verification.value;
+      if (this._typeSucceeded(actual, text) || verification.reason === 'sensitive') return;
 
-      // Verification failed on this attempt — log and retry if we have attempts left.
-      if (attempt < MAX_TYPE_ATTEMPTS - 1) continue;
+      if (attempt < MAX_TYPE_ATTEMPTS - 1) {
+        await this._sleep(250);
+        continue;
+      }
 
-      // All attempts exhausted — surface a clear ExecutorError so the agent
-      // records it in history and lets the LLM decide what to do next.
-      const got  = actual == null ? '(could not read field)' : `"${String(actual).slice(0, 60)}${actual.length > 60 ? '...' : ''}"`;
+      const got = actual == null
+        ? `(value unavailable: ${verification.reason || 'unknown reason'})`
+        : `"${String(actual).slice(0, 60)}${String(actual).length > 60 ? '...' : ''}"`;
       const want = `"${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`;
       throw new ExecutorError(
         `Text input verification failed after ${MAX_TYPE_ATTEMPTS} attempts: ` +
-        `expected ${want} but field contains ${got}. ` +
-        `The field may need a different interaction (direct click, special key, etc.).`,
+        `expected ${want} but field contains ${got}. Do not repeat the same ` +
+        `type action; inspect the current field or use a different interaction.`,
       );
+    }
+  }
+
+  async _suppressUnexpectedContextMenu(tabId) {
+    if (typeof this._bridge.suppressContextMenuOnce !== 'function') return;
+    try {
+      await this._bridge.suppressContextMenuOnce(tabId);
+    } catch {
+      // Best-effort guard; a content-script issue must not block normal clicks.
     }
   }
 
@@ -126,19 +125,19 @@ export class ActionExecutor {
    *   • The field value starts with the first 50 chars of the expected text, AND
    *   • At least 80 % of the expected length was accepted.
    *
-   * A null `actual` is NOT treated as success. Null means we could not read
-   * the field at all, which in practice covers lookup failures, stale index
-   * maps, content-script reinjection, timeouts, or a disappeared element —
-   * none of which are positive confirmation that typing landed. Requiring a
-   * non-null string means `_executeType` retries (and, if the last attempt
-   * also returns null, surfaces a clear ExecutorError) instead of silently
-   * reporting success.
+   * A null `actual` is not positive confirmation. The caller uses this only
+   * for readback polling, however: it deliberately does not clear and refill
+   * when a custom editor cannot expose a stable value.
    */
   _typeSucceeded(actual, expected) {
     if (actual == null) return false; // no positive confirmation — not success
     const a = String(actual).replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
     const e = expected.replace(/\u200B|\u200C|\u200D|\uFEFF/g, '').trim();
     if (a === e) return true;
+    if (a.toLocaleLowerCase() === e.toLocaleLowerCase()) return true;
+    const aDigits = a.replace(/\D/g, '');
+    const eDigits = e.replace(/\D/g, '');
+    if (eDigits.length >= 4 && !/[A-Za-z]/.test(a + e) && aDigits === eDigits) return true;
     const checkLen = Math.min(e.length, 50);
     return (
       a.slice(0, checkLen) === e.slice(0, checkLen) &&
@@ -148,30 +147,25 @@ export class ActionExecutor {
 
   async _readTypedValueForVerification(tabId, index, expected) {
     const delays = [0, 120, 250, 400];
-    let actual = null;
+    let result = { ok: false, value: null, reason: 'unavailable' };
 
     for (let attempt = 0; attempt < delays.length; attempt++) {
       if (delays[attempt] > 0) {
         await this._sleep(delays[attempt]);
       }
 
-      actual = await this._bridge.getElementValue(tabId, index);
-      if (this._typeSucceeded(actual, expected)) {
-        return actual;
+      if (typeof this._bridge.getElementValueResult === 'function') {
+        result = await this._bridge.getElementValueResult(tabId, index);
+      } else {
+        const value = await this._bridge.getElementValue(tabId, index);
+        result = { ok: value != null, value, reason: value == null ? 'unavailable' : null };
       }
-
-      // Rebuild the content-script index map once verification starts failing.
-      // This helps pages that swap the editable node after focus/typing.
-      if (attempt === 0 && typeof this._bridge.getPageState === 'function') {
-        try {
-          await this._bridge.getPageState(tabId);
-        } catch {
-          // noop — fall back to the next plain read attempt
-        }
+      if (this._typeSucceeded(result?.value, expected) || result?.reason === 'sensitive') {
+        return result;
       }
     }
 
-    return actual;
+    return result;
   }
 
   async _executeScroll(direction, amount, pageState) {

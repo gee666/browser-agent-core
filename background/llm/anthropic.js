@@ -16,7 +16,7 @@ export class AnthropicProvider extends LLMProvider {
     this.temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot }) {
+  async complete({ system, messages, screenshot, signal }) {
     // Convert messages to Anthropic format; system is a top-level field
     const anthropicMessages = messages.map((msg, index) => {
       const isLast = index === messages.length - 1;
@@ -45,6 +45,7 @@ export class AnthropicProvider extends LLMProvider {
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
+      signal,
       headers: {
         'x-api-key': this.apiKey,
         'anthropic-version': '2023-06-01',
