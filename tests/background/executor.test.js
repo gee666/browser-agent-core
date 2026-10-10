@@ -48,6 +48,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Even when a bridge exposes legacy helpers, no input may call them.
+  expect(mockBridge.focusElement).not.toHaveBeenCalled();
+  expect(mockBridge.scrollElementIntoView).not.toHaveBeenCalled();
+  expect(mockBridge.scrollToPosition).not.toHaveBeenCalled();
   jest.restoreAllMocks();
 });
 
@@ -78,19 +82,16 @@ describe('ActionExecutor v2', () => {
     expect(commands.indexOf('mouse_move')).toBeLessThan(commands.indexOf('mouse_click'));
   });
 
-  // 2. out-of-viewport element calls bridge.scrollElementIntoView (not a wheel event)
-  test('test_click_out_of_viewport_uses_scrollToPosition', async () => {
+  // 2. Out-of-viewport targets use native wheel input before the click.
+  test('test_click_out_of_viewport_uses_native_scroll', async () => {
     mockBridge.getPageState.mockResolvedValue(scrolledState);
     const executor = makeExecutor();
     await executor.execute({ click: { index: 1 } }, defaultPageState);
-    expect(mockBridge.scrollElementIntoView).toHaveBeenCalledWith(
-      1,                    // tabId
-      expect.any(Number),  // element index
-    );
-    // mouse_move and mouse_click must follow the scroll
-    const commands = inputCommandSequence();
-    expect(commands).toContain('mouse_move');
-    expect(commands).toContain('mouse_click');
+    expect(inputCommandSequence()).toEqual(['scroll', 'mouse_move', 'mouse_click']);
+    expect(inputCalls()[0]).toEqual(['scroll', {
+      x: 640, y: 360, delta_x: 0, delta_y: 560, duration_ms: 300,
+    }, defaultPageState.context]);
+    expect(executor._sleep.mock.calls.map(([ms]) => ms)).toEqual([600, 80, 100]);
   });
 
   // 3. out-of-viewport element causes bridge.getPageState to be called (re-fetch)
@@ -101,28 +102,25 @@ describe('ActionExecutor v2', () => {
     expect(mockBridge.getPageState).toHaveBeenCalled();
   });
 
-  // 2b. scrollElementIntoView is called with the correct tabId and element index
-  test('test_scrollElementIntoView_called_with_index', async () => {
-    mockBridge.getPageState.mockResolvedValue(scrolledState);
+  test('test_native_scroll_failure_propagates_without_dom_fallback_or_click', async () => {
+    const error = new Error('Native input host unavailable');
+    mockInputControl.execute.mockRejectedValue(error);
     const executor = makeExecutor();
-    await executor.execute({ click: { index: 1 } }, defaultPageState);
-    expect(mockBridge.scrollElementIntoView).toHaveBeenCalledWith(1, 1); // tabId=1, elIndex=1
+    await expect(executor.execute({ click: { index: 1 } }, defaultPageState)).rejects.toBe(error);
+    expect(inputCommandSequence()).toEqual(['scroll']);
+    expect(mockBridge.getPageState).not.toHaveBeenCalled();
+    expect(executor._sleep).not.toHaveBeenCalled();
   });
 
-  // 2c. falls back to scrollToPosition when scrollElementIntoView returns false
-  test('test_fallback_to_scrollToPosition_when_scrollElementIntoView_fails', async () => {
-    mockBridge.scrollElementIntoView.mockResolvedValue(false); // simulate content script miss
-    mockBridge.getPageState.mockResolvedValue(scrolledState);
+  test('test_native_scroll_above_viewport_uses_negative_relative_delta', async () => {
     const executor = makeExecutor();
-    await executor.execute({ click: { index: 1 } }, defaultPageState);
-    expect(mockBridge.scrollToPosition).toHaveBeenCalled();
-    // el index 1: rect.y=900, rect.h=40, scrollY=0 → absY=920 → targetScrollY=920-360=560
-    const [, , targetScrollY] = mockBridge.scrollToPosition.mock.calls[0];
-    expect(targetScrollY).toBe(560);
+    await executor._scrollToElement(1, 0, { rect: { x: 100, y: -100, w: 200, h: 40 } }, defaultPageState);
+    expect(inputCalls()[0]).toEqual(['scroll', {
+      x: 640, y: 360, delta_x: 0, delta_y: -440, duration_ms: 300,
+    }, defaultPageState.context]);
   });
 
-  test('test_fallback_to_scrollToPosition_accounts_for_current_scrollY', async () => {
-    mockBridge.scrollElementIntoView.mockResolvedValue(false);
+  test('test_native_scroll_uses_viewport_relative_rect_without_adding_scrollY', async () => {
     mockBridge.getPageState.mockResolvedValue(scrolledState);
     const executor = makeExecutor();
     const scrolledPageState = { ...defaultPageState, scrollY: 200, pageHeight: 2400 };
@@ -136,8 +134,9 @@ describe('ActionExecutor v2', () => {
 
     await executor.execute({ click: { index: 1 } }, offscreenPageState);
 
-    const [, , targetScrollY] = mockBridge.scrollToPosition.mock.calls[0];
-    expect(targetScrollY).toBe(760);
+    // y=900 and h=40 are viewport-relative, so delta remains 920-360.
+    expect(inputCalls()[0][0]).toBe('scroll');
+    expect(inputCalls()[0][1].delta_y).toBe(560);
   });
 
   // 2c. element still out of viewport after max attempts → throws ExecutorError
@@ -147,8 +146,33 @@ describe('ActionExecutor v2', () => {
     const executor = makeExecutor();
     await expect(executor.execute({ click: { index: 1 } }, defaultPageState))
       .rejects.toThrow(ExecutorError);
-    // scrollElementIntoView should have been attempted MAX_SCROLL_ATTEMPTS (3) times
-    expect(mockBridge.scrollElementIntoView).toHaveBeenCalledTimes(3);
+    // Only native scroll is attempted, at most MAX_SCROLL_ATTEMPTS (3) times.
+    expect(inputCommandSequence()).toEqual(['scroll', 'scroll', 'scroll']);
+    expect(executor._sleep.mock.calls.map(([ms]) => ms)).toEqual([600, 600, 600]);
+  });
+
+  test.each([
+    [1500, 340, 960, 0],
+    [-300, 340, -840, 0],
+    [1500, 900, 960, 560],
+  ])('native off-screen scroll handles both axes for rect (%i, %i)', async (x, y, deltaX, deltaY) => {
+    const executor = makeExecutor();
+    await executor._scrollToElement(1, 1, { rect: { x, y, w: 200, h: 40 } }, defaultPageState);
+    expect(inputCalls()[0]).toEqual(['scroll', {
+      x: 640, y: 360, delta_x: deltaX, delta_y: deltaY, duration_ms: 300,
+    }, defaultPageState.context]);
+  });
+
+  test('horizontal native scroll refetches coordinates and retains click timing', async () => {
+    const offscreen = { ...defaultPageState, elements: [{ index: 1, rect: { x: 1500, y: 340, w: 200, h: 40 }, inViewport: false }] };
+    const fresh = { ...defaultPageState, elements: [{ ...defaultPageState.elements[0], index: 1 }] };
+    mockBridge.getPageState.mockResolvedValue(fresh);
+    const executor = makeExecutor(); jest.spyOn(executor, '_jitterCoords').mockReturnValue({ x: 200, y: 120 });
+    await executor.execute({ click: { index: 1 } }, offscreen);
+    expect(inputCommandSequence()).toEqual(['scroll', 'mouse_move', 'mouse_click']);
+    expect(inputCalls()[0][1]).toMatchObject({ x: 640, y: 360, delta_x: 960, delta_y: 0, duration_ms: 300 });
+    expect(inputCalls()[2][1]).toMatchObject({ x: 200, y: 120, hold_ms: 40 });
+    expect(executor._sleep.mock.calls.map(([ms]) => ms)).toEqual([600, 80, 100]);
   });
 
   // unknown index — re-fetches page state once before throwing
@@ -246,18 +270,27 @@ describe('ActionExecutor v2', () => {
     expect(mockInputControl.execute).not.toHaveBeenCalled();
   });
 
-  // _executeType: focusElement is called between click and Ctrl+A
-  test('test_type_calls_focusElement_before_shortcut', async () => {
+  // Native clicking focuses the target; keep all existing settling delays.
+  test('test_type_uses_native_click_focus_and_preserves_timing', async () => {
     mockBridge.getElementValue.mockResolvedValue('hello');
     const executor = makeExecutor();
     await executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState);
-    // focusElement must be called
-    expect(mockBridge.focusElement).toHaveBeenCalledWith(1, 0);
-    // and it must happen before the Ctrl+A shortcut
-    const focusOrder   = mockBridge.focusElement.mock.invocationCallOrder[0];
-    const shortcutCall = mockInputControl.execute.mock.calls.findIndex(c => c[0] === 'press_shortcut');
-    const shortcutOrder= mockInputControl.execute.mock.invocationCallOrder[shortcutCall];
-    expect(focusOrder).toBeLessThan(shortcutOrder);
+    expect(inputCommandSequence()).toEqual(['mouse_move', 'mouse_click', 'press_shortcut', 'press_key', 'type']);
+    expect(inputCalls()[0][1].duration_ms).toBe(350);
+    expect(inputCalls()[1][1]).toMatchObject({ button: 'left', count: 1, hold_ms: 40 });
+    expect(inputCalls()[4][1]).toEqual({ text: 'hello', wpm: 55 });
+    expect(executor._sleep.mock.calls.map(([ms]) => ms)).toEqual([80, 150, 80, 80, 80, 200]);
+    for (const call of inputCalls()) expect(call[2]).toEqual(defaultPageState.context);
+  });
+
+  test('test_native_typing_click_failure_propagates_without_dom_focus_or_keyboard_input', async () => {
+    const error = new Error('Native mouse click failed');
+    mockInputControl.execute.mockResolvedValueOnce(undefined).mockRejectedValue(error);
+    const executor = makeExecutor();
+    await expect(executor.execute({ type: { index: 0, text: 'hello' } }, defaultPageState)).rejects.toBe(error);
+    expect(inputCommandSequence()).toEqual(['mouse_move', 'mouse_click']);
+    expect(executor._sleep.mock.calls.map(([ms]) => ms)).toEqual([80]);
+    expect(mockBridge.getElementValue).not.toHaveBeenCalled();
   });
 
   // _executeType: success on first attempt when value matches

@@ -6,7 +6,7 @@ function _supportsJsonMode(model) {
   if (/^o\d/i.test(model)) return false;
   return true;
 }
-import { LLMError, buildImageContent } from './utils.js';
+import { LLMError, buildImageContent, fitsOpenAISchemaEnumLimit } from './utils.js';
 
 export class OpenAIProvider extends LLMProvider {
   constructor({
@@ -25,13 +25,13 @@ export class OpenAIProvider extends LLMProvider {
     this.temperature = temperature;
   }
 
-  async complete({ system, messages, screenshot, signal }) {
+  async complete({ system, messages, screenshot, signal, responseSchema }) {
     const builtMessages = [
       { role: 'system', content: system },
       ...messages,
     ];
 
-    const supportsVision = /gpt-4o?|vision/.test(this.model);
+    const supportsVision = /gpt-4o?|vision/.test(this.model) || (responseSchema && /^gpt-[56]/.test(this.model));
     if (screenshot && supportsVision && builtMessages.length > 0) {
       const last = builtMessages[builtMessages.length - 1];
       if (last.role === 'user') {
@@ -57,7 +57,9 @@ export class OpenAIProvider extends LLMProvider {
         messages: builtMessages,
         max_tokens: this.maxTokens,
         temperature: this.temperature,
-        ...(_supportsJsonMode(this.model) ? { response_format: { type: 'json_object' } } : {}),
+        ...(responseSchema && fitsOpenAISchemaEnumLimit(responseSchema) && /^gpt-(?:4o(?:-mini)?(?:$|-2024-(?:08|11))|4\.1|[56])/.test(this.model) && /^https:\/\/api\.openai\.com\/v1\/?$/.test(this.baseUrl)
+          ? { response_format: { type: 'json_schema', json_schema: { name: 'browser_decision', strict: true, schema: responseSchema } } }
+          : _supportsJsonMode(this.model) ? { response_format: { type: 'json_object' } } : {}),
       }),
     });
 

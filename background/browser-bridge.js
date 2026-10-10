@@ -25,16 +25,15 @@ export class NavigationTimeoutError extends Error {
  *   - getElementValue(tabId, index): Promise<string|null>
  *   - sendStatus(status): void
  *
- * Optional DOM-assistance capabilities (ActionExecutor feature-detects them):
- *   - focusElement(tabId, index): Promise<boolean>
- *       Native content-script DOM focus() to reliably target an element
- *       before issuing a keyboard shortcut.
- *   - scrollElementIntoView(tabId, index): Promise<boolean>
- *       Native content-script scrollIntoView(). Return false to signal the
- *       executor should fall back to scrollToPosition or a wheel scroll.
- *   - scrollToPosition(tabId, x, y): Promise<void>
- *       Native window.scrollTo() fallback used when scrollElementIntoView()
- *       cannot reach the target.
+ * Optional assistance capabilities:
+ *   - suppressContextMenuOnce(tabId, timeoutMs): Promise<boolean>
+ *       Prevent an unwanted native context menu without issuing input.
+ *   - inspectDOM(tabId, {selector, limit}): Promise<object>
+ *   - resolveDOMTarget(tabId, {selector, expectedUrl}): Promise<object>
+ *       Read-only DOM inspection and target registration.
+ *
+ * ActionExecutor never calls focusElement, scrollElementIntoView or
+ * scrollToPosition. Native input failures surface without DOM-input fallbacks.
  *
  * Embedders may subclass BrowserBridge or provide a duck-typed replacement
  * that implements the required capabilities. See AGENTS.md — all user input
@@ -121,6 +120,28 @@ export class BrowserBridge {
       msg.includes('receiving end does not exist') ||
       msg.includes('could not establish connection')
     );
+  }
+
+  /** Bounded read-only CSS investigation. Does not execute JS or browser input. */
+  async _domInvestigationMessage(tabId, message) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new BridgeError('DOM investigation timed out')), 5000);
+      chrome.tabs.sendMessage(tabId, message, response => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) return reject(new BridgeError('DOM investigation unavailable'));
+        if (!response || typeof response !== 'object') return reject(new BridgeError('Invalid DOM investigation response'));
+        resolve(response);
+      });
+    });
+  }
+
+  async inspectDOM(tabId, { selector = 'body', limit = 40 } = {}) {
+    return this._domInvestigationMessage(tabId, { type: 'inspect_dom', selector, limit });
+  }
+
+  /** Registers a unique visible target in the current extractor index/coordinate map. */
+  async resolveDOMTarget(tabId, { selector, expectedUrl } = {}) {
+    return this._domInvestigationMessage(tabId, { type: 'resolve_dom_target', selector, expectedUrl });
   }
 
   async takeScreenshot() {
@@ -234,7 +255,7 @@ export class BrowserBridge {
     });
   }
 
-  /** Focus the effective editable control for an indexed element/wrapper. */
+  /** Legacy compatibility helper. Not used by ActionExecutor; automation input must use python-input-control. */
   async focusElement(tabId, index) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(false), 1000);

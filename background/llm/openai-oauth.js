@@ -1,5 +1,5 @@
 import { LLMProvider } from './base.js';
-import { LLMError } from './utils.js';
+import { LLMError, fitsOpenAISchemaEnumLimit } from './utils.js';
 import { generatePKCE, generateState, storeTokens, getValidTokens, clearTokens, exchangeCode, decodeJwt, OAuthError } from './oauth.js';
 
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -199,7 +199,7 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
     this._reasoningLevel = REASONING_LEVELS.has(reasoningLevel) ? reasoningLevel : 'medium';
   }
 
-  async complete({ system, messages, screenshot, signal }) {
+  async complete({ system, messages, screenshot, signal, responseSchema }) {
     const tokens = await getValidTokens(PROVIDER_KEY, (rt) => refreshOpenAIToken(rt));
     await storeTokens(PROVIDER_KEY, tokens);
 
@@ -207,6 +207,12 @@ export class OpenAICodexOAuthProvider extends LLMProvider {
     if (!accountId) throw new OAuthError('Missing accountId in stored OpenAI token. Please re-login.');
 
     const body = buildCodexBody(this._model, system, messages, screenshot, this._reasoningLevel);
+    if (responseSchema) {
+      // Responses API JSON mode uses text.format, not response_format.
+      body.text.format = fitsOpenAISchemaEnumLimit(responseSchema)
+        ? { type: 'json_schema', name: 'browser_decision', strict: true, schema: responseSchema }
+        : { type: 'json_object' };
+    }
 
     const response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
       method: 'POST',

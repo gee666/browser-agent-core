@@ -67,17 +67,14 @@ export class ActionExecutor {
       const { x, y, pageState: freshState } = await this._getValidatedCoords(index, pageState);
       const ctx = freshState.context;
 
-      // Native click positions the cursor. If supported, DOM focus resolves an
-      // indexed ARIA wrapper to its actual editable descendant before Ctrl+A.
+      // Only the native click positions the cursor and focuses the target.
       await this._inputControl.execute('mouse_move', { x, y, duration_ms: 350 + this._rand(0, 150) }, ctx);
       await this._sleep(80 + this._rand(0, 60));
       await this._suppressUnexpectedContextMenu(tabId);
       await this._inputControl.execute('mouse_click', { x, y, button: 'left', count: 1, hold_ms: 40 }, ctx);
       await this._sleep(150);
-      if (typeof this._bridge.focusElement === 'function') {
-        await this._bridge.focusElement(tabId, index);
-        await this._sleep(80);
-      }
+      // Preserve the focus-settling delay without issuing DOM input.
+      await this._sleep(80);
 
       await this._inputControl.execute('press_shortcut', { keys: ['control', 'a'] }, ctx);
       await this._sleep(80);
@@ -285,10 +282,8 @@ export class ActionExecutor {
   }
 
   /**
-   * Scrolls the element into the viewport.
-   * First tries bridge.scrollElementIntoView (native content-script scroll).
-   * Falls back to bridge.scrollToPosition when the content script can't reach
-   * the element (e.g. it returned false / timed out).
+   * Scrolls toward the element using python-input-control exclusively.
+   * Native input failures propagate; there is no DOM scrolling fallback.
    *
    * @param {number} tabId
    * @param {number} index   - element index
@@ -296,37 +291,15 @@ export class ActionExecutor {
    * @param {object} pageState
    */
   async _scrollToElement(tabId, index, el, pageState) {
-    if (typeof this._bridge.scrollElementIntoView === 'function') {
-      const ok = await this._bridge.scrollElementIntoView(tabId, index);
-      if (ok) return;
-
-      if (typeof this._bridge.scrollToPosition === 'function') {
-        // Convert viewport-relative rect coordinates to an absolute document
-        // scroll target that centres the element vertically.
-        const maxScrollY = pageState.pageHeight == null
-          ? Number.POSITIVE_INFINITY
-          : Math.max(0, pageState.pageHeight - pageState.viewportHeight);
-        const targetScrollY = Math.max(
-          0,
-          Math.min(
-            maxScrollY,
-            Math.round(
-              (pageState.scrollY || 0) + el.rect.y + el.rect.h / 2 - pageState.viewportHeight / 2,
-            ),
-          ),
-        );
-        await this._bridge.scrollToPosition(tabId, pageState.scrollX || 0, targetScrollY);
-        return;
-      }
-    }
-
     const elementCenterY = el.rect.y + el.rect.h / 2;
     const viewportCenterY = pageState.viewportHeight / 2;
     const delta = Math.round(elementCenterY - viewportCenterY);
+    const deltaX = el.rect.x < 0 || el.rect.x + el.rect.w > pageState.viewportWidth
+      ? Math.round(el.rect.x + el.rect.w / 2 - pageState.viewportWidth / 2) : 0;
     await this._inputControl.execute('scroll', {
       x: Math.round(pageState.viewportWidth / 2),
       y: Math.round(pageState.viewportHeight / 2),
-      delta_x: 0,
+      delta_x: deltaX,
       delta_y: delta,
       duration_ms: 300,
     }, pageState.context);

@@ -1,4 +1,6 @@
 import { parseJSONFromText } from './llm/utils.js';
+import { StagedDecision } from './staged-decision.js';
+import { publicJevTurnError } from './jev.js';
 
 /**
  * AgentCore orchestrates the LLM reasoning loop for browser automation (v2).
@@ -18,6 +20,10 @@ export class AgentCore {
    * @param {object} options.llm              - LLMProvider instance
    * @param {number} [options.maxIterations=20]
    * @param {boolean} [options.useVision=false]
+   * @param {'llm'|'jev'} [options.decisionMode='llm'] - Opt-in staged choice decisions
+   * @param {object} [options.decisionConfig] - Jev connection, timeout and fallback config
+   * @param {object} [options.helperLlm=options.llm] - Parameter and read-only investigation LLM
+   * @param {function} [options.onDiscovery] - Redacted missing-target diagnostics
    * @param {function} [options.onStatus]     - Called with {state, ...} on each state change
    */
   constructor({
@@ -30,10 +36,18 @@ export class AgentCore {
     verifyDoneFailOpen = false,
     onStatus = () => {},
     debugLog = null,
+    decisionMode = 'llm',
+    decisionConfig = {},
+    helperLlm = llm,
+    onDiscovery = null,
   }) {
     this._bridge = bridge;
     this._executor = executor;
     this._llm = llm;
+    if (!['llm', 'jev'].includes(decisionMode)) throw new Error('Unknown browser decision mode');
+    this._decisionMode = decisionMode;
+    this._onDiscovery = onDiscovery;
+    this._stagedDecision = decisionMode === 'jev' ? new StagedDecision(this, decisionConfig, helperLlm) : null;
     this._maxIterations = maxIterations;
     this._useVision = useVision;
     this._onStatus = onStatus;
@@ -73,7 +87,7 @@ export class AgentCore {
 
   _status(extra) {
     const s = {
-      task: this._task || null,
+      task: this._stagedDecision ? '[omitted]' : this._task || null,
       iteration: this._iteration,
       maxIterations: this._maxIterations,
       url: this._url || null,
@@ -82,6 +96,16 @@ export class AgentCore {
       timestamp: Date.now(),
       ...extra,
     };
+    if (this._stagedDecision) {
+      const origin = url => { try { return new URL(url).origin; } catch { return null; } };
+      s.url = origin(s.url);
+      if (s.plannedAction) {
+        s.plannedAction = Object.fromEntries(Object.entries(s.plannedAction).map(([name, params]) => [name,
+          name === 'type' || name === 'select_option' ? { ...params, text: '[omitted]' }
+            : name === 'navigate' ? { ...params, url: origin(params?.url) } : params,
+        ]));
+      }
+    }
     this._onStatus(s);
     this._bridge.sendStatus(s);
   }
@@ -138,6 +162,7 @@ export class AgentCore {
         this._status({ state: 'stopped', message: 'Task stopped' });
         return null;
       }
+      if (this._stagedDecision) throw publicJevTurnError(error);
       throw error;
     } finally {
       if (signal) signal.removeEventListener('abort', onExternalAbort);
@@ -155,6 +180,7 @@ export class AgentCore {
     this._url = null;
     this._title = null;
     this._history = [];
+    this._stagedDecision?.reset();
     // Clear loop-detection state so it never leaks between independent runs.
     // Without this, a new task starting on the same URL and issuing the same
     // first action inherits the last run's recent-action log and can be
@@ -183,12 +209,12 @@ export class AgentCore {
       }
 
       const tabId = await this._awaitAbortable(this._bridge.getActiveTabId());
-      const pageState = await this._awaitAbortable(this._bridge.getPageState(tabId));
+      let pageState = await this._awaitAbortable(this._bridge.getPageState(tabId));
       this._url = pageState.url;
       this._title = pageState.title;
 
       let screenshot = null;
-      if (this._useVision) {
+      if (this._useVision && !this._stagedDecision) {
         const rawScreenshot = await this._awaitAbortable(this._bridge.takeScreenshot());
         screenshot = await this._awaitAbortable(this._compressScreenshot(rawScreenshot, pageState));
       }
@@ -196,6 +222,11 @@ export class AgentCore {
       this._status({ state: 'thinking', message: 'Reading the page and deciding the next browser action.' });
 
       const steersForTurn = this._consumePendingSteers();
+      let parsed;
+      if (this._stagedDecision) {
+        parsed = await this._stagedDecision.decide(task, pageState, steersForTurn, tabId);
+        pageState = parsed._pageState || pageState;
+      } else {
       const userMsg = this._assembleUserMessage(task, pageState, stepNum, steersForTurn);
       const systemPrompt = this.systemPrompt();
 
@@ -211,7 +242,7 @@ export class AgentCore {
       }
 
       // ── Parse JSON (with one retry on failure) ─────────────────────────────
-      let parsed = null;
+      parsed = null;
       try {
         parsed = parseJSONFromText(raw);
       } catch (_) {
@@ -263,6 +294,8 @@ export class AgentCore {
         // error rather than looping forever.
       }
 
+      } // Existing normal LLM decision path.
+
       // Append step summary to history (cap at 15 entries).
       const histEntry = {
         stepNumber: stepNum,
@@ -277,7 +310,7 @@ export class AgentCore {
       if (stepsRemaining === 5) {
         histEntry.actionResult =
           '<sys>Warning: only 5 steps remaining. Prioritise completion.</sys>';
-      } else if (stepsRemaining === 2) {
+      } else if (stepsRemaining === 2 && !this._stagedDecision) {
         histEntry.actionResult =
           '<sys>CRITICAL: only 2 steps left. Call done() now even if incomplete.</sys>';
       }
@@ -304,8 +337,10 @@ export class AgentCore {
 
       if (action.done) {
         const doneMsg = action.done.message ?? '';
-        if (!this._verifyDoneEnabled) {
-          this._status({ state: 'done', message: doneMsg });
+        if (!this._verifyDoneEnabled || (this._stagedDecision && action.done.success === false)) {
+          this._status({ state: 'done', message: doneMsg,
+            ...(this._stagedDecision ? { success: action.done.success === true, blocked: action.done.success !== true } : {}),
+          });
           return doneMsg;
         }
         // Take a fresh screenshot for verification (if vision enabled)
@@ -316,7 +351,9 @@ export class AgentCore {
         }
         const verifyResult = await this._verifyDone(task, action.done, pageState, verifyShot);
         if (verifyResult.verified) {
-          this._status({ state: 'done', message: verifyResult.message });
+          this._status({ state: 'done', message: verifyResult.message,
+            ...(this._stagedDecision ? { success: true, blocked: false } : {}),
+          });
           return verifyResult.message;
         }
         // Verification failed — record why and continue
@@ -340,14 +377,18 @@ export class AgentCore {
         // Without this, models repeat the same action every step because they
         // see an empty Action Result and assume nothing happened.
         const [actionName, actionParams] = Object.entries(action)[0];
-        histEntry.actionResult = `Executed ${actionName}: ${JSON.stringify(actionParams)}`;
+        histEntry.actionResult = this._stagedDecision && (actionName === 'type' || actionName === 'select_option')
+          ? `Executed ${actionName} into element [${actionParams.index}]`
+          : this._stagedDecision && actionName === 'navigate' ? 'Executed navigate'
+            : `Executed ${actionName}: ${JSON.stringify(actionParams)}`;
+        if (parsed._discovery) this._stagedDecision.notify(parsed._discovery, 'executed');
         this._status({ state: 'running', message: histEntry.actionResult, lastAction: histEntry.actionResult });
         // Wait for any triggered navigation or DOM update to settle.
         const tabId2 = await this._awaitAbortable(this._bridge.getActiveTabId());
         await this._awaitAbortable(this._bridge.waitForPageSettle(tabId2, 1500));
         // ── Loop detection ───────────────────────────────────────────────
         // Track (url, serialised-action) pairs to spot cycles of length 1, 2, or 3.
-        const actionStr = JSON.stringify(action);
+        const actionStr = this._actionIdentity(action);
         this._recentActions.push({ url: pageState.url, actionStr });
         if (this._recentActions.length > 6) this._recentActions.shift();
         const loopLen = this._detectLoop();
@@ -363,6 +404,8 @@ export class AgentCore {
         // Stop was requested while the executor was running (e.g. mid-typing).
         // The abort() on the InputControlBridge rejected the promise; treat it
         // as a clean stop rather than an error.
+        if (parsed._discovery) this._stagedDecision.notify(parsed._discovery,
+          this._stopped || err.name === 'InputControlAbortError' ? 'execution cancelled' : 'execution failed');
         if (this._stopped || err.name === 'InputControlAbortError') {
           this._status({ state: 'stopped' });
           return null;
@@ -371,8 +414,9 @@ export class AgentCore {
           // Recoverable: record the failure in history so the LLM can adapt
           // (e.g. stale index, element off-screen, page changed).
           // Do NOT abort — let the agent try a different approach next step.
-          histEntry.actionResult = `Action failed: ${err.message}`;
-          this._status({ state: 'error', message: err.message });
+          const message = this._stagedDecision ? 'Browser action failed. Inspect the updated page before retrying.' : err.message;
+          histEntry.actionResult = `Action failed: ${message}`;
+          this._status({ state: 'error', message });
           // continue to next iteration
         } else {
           throw err; // unexpected — propagate
@@ -396,6 +440,15 @@ export class AgentCore {
     return steers;
   }
 
+  _actionIdentity(action) {
+    const [name, params] = Object.entries(action)[0];
+    if (!this._stagedDecision || (name !== 'type' && name !== 'select_option')) return JSON.stringify(action);
+    // Keep loop detection sensitive to differing text without retaining that text.
+    let fingerprint = 2166136261;
+    for (const char of params.text) fingerprint = Math.imul(fingerprint ^ char.codePointAt(0), 16777619) >>> 0;
+    return JSON.stringify({ [name]: { index: params.index, textFingerprint: fingerprint, textLength: params.text.length } });
+  }
+
   _describeAction(action) {
     const entry = Object.entries(action || {})[0];
     if (!entry) return 'Preparing browser action.';
@@ -406,7 +459,7 @@ export class AgentCore {
       case 'select_option': return `Selecting an option in element [${params?.index}]`;
       case 'scroll': return `Scrolling ${params?.direction || 'down'} (${params?.amount || 'medium'})`;
       case 'scroll_element': return `Scrolling element [${params?.index}] ${params?.direction || 'down'}`;
-      case 'navigate': return `Navigating to ${params?.url || 'a page'}`;
+      case 'navigate': return this._stagedDecision ? 'Navigating to another page' : `Navigating to ${params?.url || 'a page'}`;
       case 'wait': return `Waiting ${params?.seconds || ''} seconds`;
       case 'done': return 'Preparing final answer';
       default: return `Running ${name}`;
@@ -718,6 +771,7 @@ export class AgentCore {
    * @returns {Promise<string>}
    */
   async _llmComplete(params, { stepNum, turnType }) {
+    if (this._stagedDecision) return this._stagedDecision.complete(this._llm, params);
     const response = await this._awaitAbortable(this._llm.complete({
       ...params,
       signal: this._abortController?.signal,
@@ -833,7 +887,7 @@ export class AgentCore {
       }
       return `data:image/jpeg;base64,${btoa(binary)}`;
     } catch (e) {
-      console.warn('[AgentCore] Screenshot compression failed, using original:', e);
+      if (!this._stagedDecision) console.warn('[AgentCore] Screenshot compression failed, using original:', e);
       return dataUrl;
     }
   }

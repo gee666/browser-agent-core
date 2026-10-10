@@ -1,3 +1,23 @@
+/** OpenAI counts enum entries across the whole serialized strict schema. */
+export function fitsOpenAISchemaEnumLimit(schema) {
+  let count = 0;
+  let visited = 0;
+  const pending = [schema];
+  while (pending.length) {
+    const node = pending.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (++visited > 10000) return false; // also bounds cyclic/invalid custom schemas
+    if (Array.isArray(node.enum)) {
+      count += node.enum.length;
+      if (count > 1000) return false;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key !== 'enum' && value && typeof value === 'object') pending.push(value);
+    }
+  }
+  return true;
+}
+
 export class LLMParseError extends Error {
   constructor(message, rawText) {
     super(message);

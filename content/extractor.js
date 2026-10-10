@@ -30,6 +30,9 @@
   // Populated on every getPageState() call so the executor can call
   // get_element_value message.
   var indexToElement = new Map();
+  // Explicitly discovered targets survive re-extraction and native scrolling.
+  // This does not change ordinary extraction until resolve_dom_target is used.
+  var discoveredElements = new Set();
   var contextMenuGuardTimer = null;
   var contextMenuGuard = null;
 
@@ -507,6 +510,13 @@
   function getPageState() {
     var state = { elements: [], lines: [], nextIndex: 0 };
     walkNode(document.body, 0, state);
+    discoveredElements.forEach(function (el) {
+      if (!isInvestigationEligible(el)) { discoveredElements.delete(el); return; }
+      if (state.elements.some(function (info) { return info._domEl === el; })) return;
+      var info = buildElementInfo(el, 0, state.nextIndex++);
+      state.elements.push(info);
+      state.lines.push({ type: 'element', depth: 0, element: info });
+    });
 
     // Update seenElements and indexToElement to the current extraction's set.
     var newSeen = new WeakSet();
@@ -537,9 +547,107 @@
     };
   }
 
+  // Read-only investigation accepts CSS selectors, never JavaScript or input actions.
+  function structuralLocator(el) {
+    var parts = [];
+    for (var node = el; node && node.nodeType === 1 && parts.length < 40; node = node.parentElement) {
+      var nth = 1;
+      for (var sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) nth++;
+      parts.unshift(node.tagName.toLowerCase() + ':nth-child(' + nth + ')');
+    }
+    if (node) return null;
+    return parts.join(' > ');
+  }
+
+  function isInvestigationEligible(el) {
+    if (!isVisible(el)) return false;
+    for (var node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (shouldSkip(node) || node.disabled) return false;
+    }
+    return true;
+  }
+
+  function validSelector(selector) {
+    return typeof selector === 'string' && selector.length > 0 && selector.length <= 1000;
+  }
+
+  function inspectDOM(selector, limit) {
+    if (!validSelector(selector)) return { ok: false, reason: 'invalid selector' };
+    var root;
+    try { root = document.querySelector(selector); }
+    catch (_) { return { ok: false, reason: 'invalid selector' }; }
+    if (!root) return { ok: true, url: location.href, elements: [], truncated: false };
+    limit = Math.max(1, Math.min(Number(limit) || 40, 40));
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    var node = root;
+    var elements = [];
+    var visited = 0;
+    while (node && visited++ < 2000 && elements.length < limit) {
+      if (isInvestigationEligible(node)) {
+        var info = buildElementInfo(node, 0, -1);
+        // Inspection is descriptive. Never return editable values, raw HTML,
+        // arbitrary attributes, scripts, or event handlers.
+        delete info._domEl;
+        delete info.currentValue;
+        delete info.attrs.value;
+        delete info.attrs.href;
+        info.locator = structuralLocator(node);
+        elements.push(info);
+      }
+      node = walker.nextNode();
+    }
+    return { ok: true, url: location.href, elements: elements, truncated: !!node };
+  }
+
+  function structuralDOMContext(el, index) {
+    function describe(node) {
+      var attrs = {};
+      ['role', 'type', 'tabindex', 'contenteditable', 'aria-expanded', 'aria-disabled', 'aria-hidden', 'aria-selected', 'aria-checked', 'aria-readonly'].forEach(function (key) {
+        var value = node.getAttribute(key);
+        if (value !== null) attrs[key] = value;
+      });
+      var attributeNames = ['id', 'class', 'role', 'type', 'tabindex', 'contenteditable', 'aria-label', 'aria-labelledby', 'placeholder', 'title', 'data-testid', 'data-test-id', 'data-cy', 'onclick'].filter(function (key) { return node.hasAttribute(key); });
+      return { tag: node.tagName.toLowerCase(), attrs: attrs, attributeNames: attributeNames, childElementCount: node.children.length, locator: structuralLocator(node) };
+    }
+    var ancestors = [];
+    for (var node = el.parentElement; node && ancestors.length < 6; node = node.parentElement) ancestors.push(describe(node));
+    var children = Array.from(el.children).slice(0, 8).map(describe);
+    var target = describe(el);
+    target.index = index;
+    return { target: target, ancestors: ancestors, children: children };
+  }
+
+  function resolveDOMTarget(selector, expectedUrl) {
+    if (!validSelector(selector) || expectedUrl !== location.href) return { ok: false, reason: 'stale page or invalid selector' };
+    var matches;
+    try { matches = document.querySelectorAll(selector); }
+    catch (_) { return { ok: false, reason: 'invalid selector' }; }
+    // Ambiguous, disabled and off-screen elements are never registered.
+    if (matches.length !== 1 || !isInvestigationEligible(matches[0])) return { ok: false, reason: 'target must be unique, visible and enabled' };
+    var el = matches[0];
+    var info = buildElementInfo(el, 0, -1);
+    if (!info.inViewport) return { ok: false, reason: 'target is off screen' };
+    var locator = structuralLocator(el);
+    if (!locator) return { ok: false, reason: 'target path is too deep' };
+    if (!discoveredElements.has(el) && discoveredElements.size >= 20) return { ok: false, reason: 'discovery limit reached' };
+    discoveredElements.add(el);
+    var pageState = getPageState();
+    var index = -1;
+    indexToElement.forEach(function (value, key) { if (value === el) index = key; });
+    return { ok: index >= 0, index: index, locator: locator, domContext: structuralDOMContext(el, index), pageState: pageState };
+  }
+
   // ── Message listener ──────────────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+    if (message.type === 'inspect_dom') {
+      sendResponse(inspectDOM(message.selector || 'body', message.limit));
+      return true;
+    }
+    if (message.type === 'resolve_dom_target') {
+      sendResponse(resolveDOMTarget(message.selector, message.expectedUrl));
+      return true;
+    }
     if (message.type === 'get_page_state') {
       sendResponse(getPageState());
       return true;

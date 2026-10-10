@@ -7,6 +7,8 @@ export class LLMProvider {
    * @param {string} options.system - System prompt
    * @param {Array<{role:string,content:string}>} options.messages - Conversation history
    * @param {string|null} options.screenshot - Base64 PNG data URL or null
+   * @param {AbortSignal} [options.signal] - Cancellation signal
+   * @param {object} [options.responseSchema] - Optional JSON schema; supported adapters request strict output
    * @returns {Promise<string>} Raw LLM response text
    */
   async complete({ system, messages, screenshot }) {
