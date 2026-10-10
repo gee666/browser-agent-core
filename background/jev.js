@@ -21,7 +21,7 @@ export function publicJevTurnError(error) {
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const RESERVED_PARAMS = new Set(['state', 'questions', 'images', 'model', '__proto__', 'constructor', 'prototype']);
-const RESERVED_HEADERS = /^(authorization|content-(?:type|length|encoding)|host|cookie|origin|referer|connection|transfer-encoding|te|trailer|upgrade|accept-encoding|accept-charset|user-agent|proxy-.*|sec-.*)$/i;
+const RESERVED_HEADERS = /^(authorization|content-(?:type|length|encoding)|host|cookie|origin|referer|connection|transfer-encoding|te|trailer|upgrade|accept-encoding|accept-charset|user-agent|x-autojev-cache-mode|proxy-.*|sec-.*)$/i;
 
 // Read dimensions without decoding pixels. Invalid files still fail at the API.
 function imagePixels(data) {
@@ -62,20 +62,26 @@ export function normalizeJevConfig(config = {}) {
   url.pathname = path.endsWith('/v1/systemone') ? path : path.endsWith('/v1') ? `${path}/systemone` : `${path}/v1/systemone`;
   const timeoutMs = config.timeoutMs ?? 1200000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3600000) throw new JevError('Invalid Jev timeout');
+  // Standalone embedders retain server/legacy defaults; the extension selects context.
+  const cacheMode = config.cacheMode === undefined ? 'server' : config.cacheMode;
+  if (!['server', 'none', 'options', 'context'].includes(cacheMode)) throw new JevError('Invalid Jev cache mode');
   const headers = config.headers ?? {};
   const requestParams = config.requestParams ?? {};
   if (!object(headers) || !object(requestParams)) throw new JevError('Jev headers and request params must be objects');
+  const headerNames = new Set();
   for (const [key, value] of Object.entries(headers)) {
-    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) || RESERVED_HEADERS.test(key) || typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) {
+    const lowerName = key.toLowerCase();
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) || RESERVED_HEADERS.test(key) || headerNames.has(lowerName) || typeof value !== 'string' || /[\u0000-\u001f\u007f\u0100-\uffff]/.test(value)) {
       throw new JevError('Invalid or reserved Jev header');
     }
+    headerNames.add(lowerName);
   }
   if (Object.keys(requestParams).some(key => RESERVED_PARAMS.has(key))) throw new JevError('Reserved Jev request parameter');
   try { JSON.stringify(requestParams); } catch { throw new JevError('Jev request params must be JSON serializable'); }
   if (config.apiKey != null && (typeof config.apiKey !== 'string' || /[\u0000-\u001f\u007f]/.test(config.apiKey))) throw new JevError('Invalid Jev API key');
   if (config.model != null && (typeof config.model !== 'string' || !config.model.trim())) throw new JevError('Invalid Jev model');
   if (config.fallbackEnabled != null && typeof config.fallbackEnabled !== 'boolean') throw new JevError('Invalid Jev fallback setting');
-  return { endpoint: url.href, apiKey: config.apiKey || '', model: config.model || 'jev-latest', headers: { ...headers }, requestParams: { ...requestParams }, timeoutMs, fallbackEnabled: config.fallbackEnabled ?? true };
+  return { endpoint: url.href, apiKey: config.apiKey || '', model: config.model || 'jev-latest', cacheMode, headers: { ...headers }, requestParams: { ...requestParams }, timeoutMs, fallbackEnabled: config.fallbackEnabled ?? true };
 }
 
 export function validateChoices(answers, questions) {
@@ -125,7 +131,7 @@ export async function classifyJev(config, { state, questions, images = [], signa
       try { res = await fetch(c.endpoint, {
         // Never forward credentials, custom headers or page state to redirects.
         method: 'POST', redirect: 'error', signal: controller.signal,
-        headers: { ...c.headers, 'Content-Type': 'application/json', ...(c.apiKey ? { Authorization: `Bearer ${c.apiKey}` } : {}) },
+        headers: { ...c.headers, 'Content-Type': 'application/json', ...(c.apiKey ? { Authorization: `Bearer ${c.apiKey}` } : {}), ...(c.cacheMode !== 'server' ? { 'X-AutoJev-Cache-Mode': c.cacheMode } : {}) },
         body: JSON.stringify({ ...c.requestParams, model: c.model, state, questions, ...(images.length ? { images } : {}) }),
       }); } catch { throw new JevError('Jev request failed'); }
       if (!res.ok) throw new JevError(`Jev HTTP ${Number(res.status) || 0}`);

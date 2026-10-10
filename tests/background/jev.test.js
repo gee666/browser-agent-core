@@ -23,6 +23,96 @@ test.each([
   try { normalizeJevConfig(config); } catch (e) { expect(e.message).not.toContain('secret'); }
 });
 
+test('standalone core defaults to server without overriding legacy headers', () => {
+  expect(normalizeJevConfig({}).cacheMode).toBe('server');
+  const headers = { 'X-AutoJev-Prefix-Cache': 'true' };
+  expect(normalizeJevConfig({ headers }).headers).toEqual(headers);
+});
+
+test.each(['server', 'none', 'options', 'context'])('validates and posts cache mode %s without changing the body or credentials', async cacheMode => {
+  global.fetch.mockResolvedValue({ ok: true, json: async () => ({ answers: { action: 'CLICK' } }) });
+  const headers = { 'x-autojev-prefix-cache': 'true', 'X-Client': 'fixture' };
+  const config = { cacheMode, headers, apiKey: 'private-key', model: 'custom-model', requestParams: { temperature: 0 } };
+  expect(normalizeJevConfig(config).cacheMode).toBe(cacheMode);
+  await classifyJev(config, { state: 'shared-state', questions });
+  const request = global.fetch.mock.calls[0][1];
+  expect(request.headers).toEqual({
+    ...headers, 'Content-Type': 'application/json', Authorization: 'Bearer private-key',
+    ...(cacheMode === 'server' ? {} : { 'X-AutoJev-Cache-Mode': cacheMode }),
+  });
+  expect(JSON.parse(request.body)).toEqual({ model: 'custom-model', temperature: 0, state: 'shared-state', questions });
+  expect(config.headers).toEqual(headers);
+});
+
+test.each(['', 'CONTEXT', ' context ', 'invalid-secret', null, false, 1, {}, []])('rejects invalid cache mode %# before fetching without echoing values', async cacheMode => {
+  expect(() => normalizeJevConfig({ cacheMode })).toThrow('Invalid Jev cache mode');
+  await expect(classifyJev({ cacheMode }, { state: 'x', questions })).rejects.toThrow('Invalid Jev cache mode');
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+test.each(['X-AutoJev-Cache-Mode', 'x-autojev-cache-mode', 'X-AUTOJEV-CACHE-MODE', 'x-AuToJeV-CaChE-mOdE'])('reserves custom %s for every mode', async name => {
+  for (const cacheMode of ['server', 'none', 'options', 'context']) {
+    await expect(classifyJev({ cacheMode, headers: { [name]: 'context' } }, { questions })).rejects.toThrow('Invalid or reserved Jev header');
+  }
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+test.each([
+  { 'X-Client': 'a', 'x-client': 'b' },
+  { 'X-AutoJev-Prefix-Cache': 'true', 'x-autojev-prefix-cache': 'false' },
+  { 'X-Client': 'non-byte-🙂' },
+])('shared header rules reject case collisions and non-byte values %#', headers => {
+  expect(() => normalizeJevConfig({ headers })).toThrow('Invalid or reserved Jev header');
+});
+
+test('shared header validation retains HTTP byte-string values', () => {
+  expect(normalizeJevConfig({ headers: { 'X-Client': 'café' } }).headers).toEqual({ 'X-Client': 'café' });
+});
+
+test.each(['true', 'false'])('legacy prefix-cache %s remains present alongside explicit mode', async value => {
+  global.fetch.mockResolvedValue({ ok: true, json: async () => ({ answers: { action: 'CLICK' } }) });
+  await classifyJev({ cacheMode: 'context', headers: { 'X-AutoJev-Prefix-Cache': value } }, { questions });
+  expect(global.fetch.mock.calls[0][1].headers['X-AutoJev-Prefix-Cache']).toBe(value);
+  expect(global.fetch.mock.calls[0][1].headers['X-AutoJev-Cache-Mode']).toBe('context');
+});
+
+test.each(['server', 'none', 'options', 'context'])('connection test honors cache mode %s', async cacheMode => {
+  global.fetch.mockResolvedValue({ ok: true, json: async () => ({ answers: { connection: 'READY' } }) });
+  await expect(testJevConnection({ cacheMode })).resolves.toEqual({ ok: true });
+  const headers = global.fetch.mock.calls[0][1].headers;
+  expect(headers['X-AutoJev-Cache-Mode']).toBe(cacheMode === 'server' ? undefined : cacheMode);
+});
+
+test.each(['server', 'none', 'options', 'context'])('sends one controlled mode header over HTTP for %s, except server', async cacheMode => {
+  global.fetch = originalFetch;
+  const received = [];
+  const server = createServer((request, response) => {
+    received.push(request);
+    request.resume();
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ answers: { connection: 'READY' } }));
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    await expect(testJevConnection({
+      baseUrl: `http://127.0.0.1:${server.address().port}`, cacheMode, apiKey: 'fixture-key',
+      headers: { 'X-AutoJev-Prefix-Cache': 'false' }, timeoutMs: 1000,
+    })).resolves.toEqual({ ok: true });
+    expect(received).toHaveLength(1);
+    const request = received[0];
+    expect(request.headers['x-autojev-cache-mode']).toBe(cacheMode === 'server' ? undefined : cacheMode);
+    expect(request.rawHeaders.filter(value => value.toLowerCase() === 'x-autojev-cache-mode')).toHaveLength(cacheMode === 'server' ? 0 : 1);
+    expect(request.headers['x-autojev-prefix-cache']).toBe('false');
+    expect(request.headers.authorization).toBe('Bearer fixture-key');
+    expect(request.url).toBe('/v1/systemone');
+  } finally {
+    await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+  }
+});
+
 test('posts the inspected contract with top-level data URI images and extra params', async () => {
   global.fetch.mockResolvedValue({ ok: true, json: async () => ({ answers: { action: { choice: 'CLICK', confidence: .9, probabilities: {} } }, usage: {} }) });
   const result = await classifyJev({ apiKey: 'private-key', headers: { 'X-Client': 'fixture' }, requestParams: { temperature: 0 } }, { state: { goal: 'click' }, questions, images: ['data:image/png;base64,YQ=='] });
@@ -30,6 +120,7 @@ test('posts the inspected contract with top-level data URI images and extra para
   const [url, request] = global.fetch.mock.calls[0];
   expect(url).toBe('http://localhost:8765/v1/systemone');
   expect(request.headers.Authorization).toBe('Bearer private-key');
+  expect(request.headers['X-AutoJev-Cache-Mode']).toBeUndefined();
   expect(request.redirect).toBe('error');
   expect(JSON.parse(request.body)).toEqual({ model: 'jev-latest', state: { goal: 'click' }, questions, images: ['data:image/png;base64,YQ=='], temperature: 0 });
 });

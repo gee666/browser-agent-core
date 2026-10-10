@@ -87,6 +87,7 @@ const agent = new AgentCore({
     baseUrl: 'http://localhost:8765',
     apiKey: jevKeyFromStorage,
     model: 'jev-latest',
+    cacheMode: 'context', // 'server' by default in standalone core
     headers: {},
     requestParams: {},
     timeoutMs: 1200000,
@@ -98,6 +99,8 @@ const agent = new AgentCore({
 ```
 
 The core does not read settings or credentials from storage. Embedders supply configuration. `baseUrl` accepts an origin, a `/v1` URL, or a full `/v1/systemone` endpoint. Headers must have valid names and string values without control characters. Authentication and transport headers are reserved. Request parameters cannot replace `model`, `state`, `questions`, or `images`. The default timeout is 1200000ms, following AutoJev's minimum 1200-second loading/queue guidance. Explicit timeouts must be integer milliseconds from 1 to 3600000; shorter values are accepted for controlled tests but are not recommended for local model requests.
+
+`cacheMode` accepts `server`, `none`, `options`, or `context`. Explicit modes send `X-AutoJev-Cache-Mode`; `server` omits it. This header is reserved case-insensitively in custom headers, and duplicate header names ignoring case are rejected. Legacy `X-AutoJev-Prefix-Cache` remains allowed; AutoJev gives the new mode precedence. The extension defaults to `context`, even for existing settings without a saved mode. Standalone core defaults to `server` to retain legacy behavior. Connection probes use the same mode. AutoJev may bypass caching for images.
 
 Each step starts with one action question and five independent speculative target questions. Private decision context retains the last 20 user steers and up to three observed DOM snapshots, capped at 6000 characters each, so corrections and observed values can survive navigation. Both reset between runs. `SCREENSHOT_NEEDED` requests one screenshot stage. That stage removes the screenshot choice and permits `TARGET_NOT_LISTED` for indexed actions. Up to 253 current targets are offered, preferring on-screen elements. Jev failures and invalid choices use at most two normal LLM classification attempts with the same state, choices and image. `BLOCKED` is a valid decision, not a provider failure. The selected action/target and helper parameters are validated locally; unrelated target heads are ignored.
 
