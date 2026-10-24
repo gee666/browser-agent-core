@@ -1,5 +1,5 @@
 export { AgentCore, AgentCore as BrowserAgent } from './agent.js';
-export { testJevConnection } from './jev.js';
+export { testJevConnection, normalizeJevConfig } from './jev.js';
 export { formatDebugEntry, makeDebugFilename } from './debug-logger.js';
 export { BrowserBridge } from './browser-bridge.js';
 export { ActionExecutor } from './executor.js';
