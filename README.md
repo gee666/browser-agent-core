@@ -22,6 +22,9 @@ Everything needed in the extension service worker / background script:
 | `BrowserBridge` | Abstracts Chrome extension APIs (tabs, screenshots, page state) |
 | `ActionExecutor` | Sequences actions, auto-scrolls off-screen elements, auto-moves mouse before clicks |
 | `InputControlBridge` | Native messaging adapter for `python-input-control` |
+| `NativeScriptService` | AI translation of external JavaScript into validated native input and read plans |
+| `NativeScriptError` | Script failure with stable code and optional step index |
+| `NativeScriptPageBridge` | Fixed read-only isolated-world geometry and data adapter |
 | `OpenAIProvider` | LLM provider for OpenAI-compatible APIs |
 | `AnthropicProvider` | LLM provider for Anthropic Claude |
 | `OllamaProvider` | LLM provider for local Ollama models |
@@ -74,6 +77,28 @@ console.log(result);
 `ActionExecutor` sends mouse movement, clicks, typing, shortcuts, keys and scrolling exclusively through `inputControl.execute`. Native clicking focuses editable targets. Existing movement, typing and settling delays are retained, including the 80ms focus-settling pause. Off-screen targets use native wheel scrolling with the existing viewport-relative coordinate calculation on both axes, up to three scroll/refetch attempts. Horizontal off-screen targets add a native horizontal wheel delta; wheel origin, duration, click coordinates and settling delays are unchanged.
 
 The executor never calls `bridge.focusElement`, `bridge.scrollElementIntoView` or `bridge.scrollToPosition`, even if an embedder supplies them. Native input failures propagate without a DOM-input fallback. DOM-only focus cannot rescue an incorrectly chosen wrapper; target its actual editable control instead.
+
+## External JavaScript through native input
+
+`NativeScriptService` sends every external source string, including read-only expressions, to the configured AI provider. It validates a bounded JSON plan and interprets supported input, reads and return expressions. It never executes supplied or generated JavaScript. Input uses only the Python `InputControlBridge`; no CDP backend or DOM-input fallback is accepted.
+
+```javascript
+import { NativeScriptService, InputControlBridge } from 'browser-agent-core/background';
+
+const scripts = new NativeScriptService({ llm, inputControl: new InputControlBridge() });
+const result = await scripts.executeExternalScript({
+  tabId, kind: 'expression', source: 'document.title', args: [], signal,
+});
+// { value: 'Example', type: 'string', subtype: undefined }
+```
+
+The default adapter supplies geometry and screen context without an extractor dependency. Native actions require the target tab to be active and its Chrome window focused. Overlapping script requests reject through a module-wide busy lock. Abort and timeout stop subsequent actions and abort active native input.
+
+This is a supported-subset translator, not a full JavaScript runtime. Common DOM reads, selector input, relative/absolute native scrolling, typed JSON results and basic arithmetic are supported. Arbitrary page functions, network calls, unsupported DOM mutation and unrepresentable results reject. Validation enforces allowed operations but does not prove that AI translation preserved source semantics. See [the API, supported subset and failure rules](docs/native-scripts.md).
+
+## Manual CAPTCHA handoff
+
+When a CAPTCHA blocks a task, normal and Jev decisions can select `manual_captcha`. The run ends with a terminal `paused` result and a screenshot for human review, with no automatic solving or resume. Embedders must preserve the handoff and wait for the user to start a new task. See [manual CAPTCHA decisions, result fields and embedding rules](docs/manual-captcha.md).
 
 ## Staged Jev decisions
 

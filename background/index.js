@@ -4,6 +4,8 @@ export { formatDebugEntry, makeDebugFilename } from './debug-logger.js';
 export { BrowserBridge } from './browser-bridge.js';
 export { ActionExecutor } from './executor.js';
 export { InputControlBridge } from './input-control.js';
+export { NativeScriptService, NativeScriptError } from './native-script.js';
+export { NativeScriptPageBridge } from './native-script-page.js';
 export { OpenAIProvider } from './llm/openai.js';
 export { AnthropicProvider } from './llm/anthropic.js';
 export { OllamaProvider } from './llm/ollama.js';
