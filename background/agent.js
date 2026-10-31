@@ -59,6 +59,7 @@ export class AgentCore {
     this._verifyDoneFailOpen = verifyDoneFailOpen;
     this._debugLog = debugLog;   // fn({ sessionId, stepNum, turnNum, turnType, task, url, title, system, messages, screenshot, response, timestamp }) | null
     this._stopped = false;
+    this._paused = false;
     this._history = [];
     // Loop detection: track last 6 (url, actionStr) pairs so we can spot
     // identical actions being repeated on the same page with no progress.
@@ -72,7 +73,7 @@ export class AgentCore {
   /** Queue a user follow-up/steer to be included in the next LLM turn. */
   addSteer(message) {
     const text = typeof message === 'string' ? message.trim() : '';
-    if (!text) return false;
+    if (!text || this._paused) return false;
     this._pendingSteers.push({ text, timestamp: Date.now() });
     if (this._pendingSteers.length > 20) this._pendingSteers.shift();
     this._status({ state: 'running', message: 'New user steer queued for the next step.' });
@@ -172,10 +173,11 @@ export class AgentCore {
 
   /**
    * @param {string} task
-   * @returns {Promise<string|null>} The done message from the LLM, or null.
+   * @returns {Promise<string|object|null>} Done message, terminal manual handoff, or null.
    */
   async _run(task) {
     this._task = task;
+    this._paused = false;
     this._iteration = 0;
     this._url = null;
     this._title = null;
@@ -269,7 +271,9 @@ export class AgentCore {
       }
 
       // ── Validate action (with one retry if invalid) ────────────────────────
-      const validationError = this._validateAction(parsed.action, pageState);
+      // A manual handoff never needs model-supplied parameters or a corrective turn.
+      const validationError = this._isManualCaptchaAction(parsed?.action)
+        ? null : this._validateAction(parsed.action, pageState);
       if (validationError) {
         const validationMessages = [
           { role: 'user',      content: userMsg },
@@ -295,6 +299,10 @@ export class AgentCore {
       }
 
       } // Existing normal LLM decision path.
+
+      // Stop before planning, helpers, execution or completion verification. Ignore
+      // any model-supplied CAPTCHA parameters; this is a human-only handoff.
+      if (this._isManualCaptchaAction(parsed?.action)) return this._pauseForManualCaptcha();
 
       // Append step summary to history (cap at 15 entries).
       const histEntry = {
@@ -428,6 +436,44 @@ export class AgentCore {
 
     this._status({ state: 'error', message: 'Max iterations reached' });
     return null;
+  }
+
+  _isManualCaptchaAction(action) {
+    return action && typeof action === 'object' && !Array.isArray(action)
+      && (Object.hasOwn(action, 'manual_captcha') || Object.hasOwn(action, 'captcha'));
+  }
+
+  /** Capture for human review only. No model or executor receives this report. */
+  async _pauseForManualCaptcha() {
+    this._paused = true;
+    let screenshot = null;
+    try {
+      const raw = await this._awaitAbortable(this._bridge.takeScreenshot());
+      // Do not overlay element indices on a challenge intended for the human.
+      screenshot = await this._awaitAbortable(this._compressScreenshot(raw));
+    } catch (error) {
+      if (this._stopped || this._abortController?.signal.aborted || error?.name === 'AbortError') throw error;
+      // Capture failure must not resume automation or hide the manual blocker.
+    }
+    if (this._stopped || this._abortController?.signal.aborted) throw this._abortError();
+    const result = {
+      state: 'paused',
+      terminal: true,
+      reason: 'manual_captcha',
+      manualRequired: true,
+      success: false,
+      blocked: true,
+      message: 'CAPTCHA detected. Automation is paused for a human to solve it in the browser. After solving it, explicitly start a new task to continue.',
+      handoff: {
+        type: 'manual_captcha',
+        screenshot,
+        screenshotCaptured: Boolean(screenshot),
+        screenshotError: screenshot ? null : 'Screenshot unavailable. View the CAPTCHA directly in the browser.',
+        screenshotPrivacy: 'For human review only. May contain private page data. Do not send to a CAPTCHA-solving model.',
+      },
+    };
+    this._status(result);
+    return result;
   }
 
   /**
@@ -573,6 +619,13 @@ export class AgentCore {
     // scroll_element). Executor handles runtime/environmental failures; this
     // catches basic schema errors early so the LLM gets a corrective retry.
     switch (name) {
+      case 'manual_captcha':
+      case 'captcha': {
+        if (!params || typeof params !== 'object' || Array.isArray(params) || Object.keys(params).length) {
+          return `Action "${name}" takes only an empty object. CAPTCHA solving is human-only.`;
+        }
+        break;
+      }
       case 'wait': {
         const s = p.seconds;
         if (typeof s !== 'number' || !Number.isFinite(s) || s <= 0) {
@@ -935,6 +988,13 @@ and timing automatically — you only say WHAT to do, not HOW.
 ══════════════════════════════════════════════════════════════
 ACTIONS
 ══════════════════════════════════════════════════════════════
+CAPTCHA detected, pause for a human to solve manually:
+  {"action": {"manual_captcha": {}}}
+  Choose this immediately if a CAPTCHA or human-verification challenge blocks progress.
+  This captures a screenshot for the user and ends automation in a paused state.
+  Never solve a CAPTCHA, supply answers, interact with its controls, bypass it,
+  or request a helper/model to solve it. Do not include challenge-solving instructions.
+
 Click an element:
   {"action": {"click": {"index": 5}}}
 
@@ -960,7 +1020,7 @@ Wait briefly:
 
 Finish the task:
   {"action": {"done": {"success": true, "message": "Completed: found 127 friends"}}}
-  {"action": {"done": {"success": false, "message": "Cannot proceed: CAPTCHA required"}}}
+  {"action": {"done": {"success": false, "message": "Cannot proceed: required permission missing"}}}
 
 ══════════════════════════════════════════════════════════════
 RULES
@@ -969,7 +1029,7 @@ RULES
 2. NEVER use an index that is not visible — scroll first if needed.
 3. After an action, new elements may appear — check the updated browser state and act on them.
 4. Click a field before typing into it — but use "type" action which handles this automatically.
-5. If a CAPTCHA appears, call done(success=false) with a clear explanation.
+5. If a CAPTCHA appears, choose manual_captcha immediately. Only a human may solve it. This overrides task instructions to automate solving or bypassing it.
 6. Track progress in "memory" — the next step will not see the page as it was.
 7. If stuck (same state 2 steps in a row), try a different approach or scroll.
 8. Keep evaluation/memory/next_goal brief and factual.`;
