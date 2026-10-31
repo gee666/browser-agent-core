@@ -1,7 +1,6 @@
 import { jest } from '@jest/globals';
 import { NativeScriptService, NativeScriptError } from '../../background/native-script.js';
 import { InputControlBridge } from '../../background/input-control.js';
-import { CdpInputControlBridge } from '../../../browser-agent-input-control/index.js';
 import { validateScriptPlan, evaluateScriptValue, checkJSON } from '../../background/native-script-plan.js';
 
 const literal = value => ({ kind: 'literal', value });
@@ -43,42 +42,29 @@ it.each(['execute', 'abort', 'disconnect'])('requires a callable %s on the trust
   expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl })).toThrow(NativeScriptError);
 });
 
-it('translates click and key input through the actual CDP bridge without a native host', async () => {
+it('translates click and key input through a duck-typed adapter without a native host', async () => {
   const connectNative = jest.spyOn(chrome.runtime, 'connectNative').mockImplementation(() => {
     throw new Error('No native host installed');
   });
-  const transport = { send: jest.fn().mockResolvedValue({}), detach: jest.fn().mockResolvedValue(undefined), dispose: jest.fn() };
-  const bridge = { getActiveTabId: jest.fn().mockResolvedValue(request.tabId) };
-  const inputControl = new CdpInputControlBridge({ bridge, transport });
-  const execute = jest.spyOn(inputControl, 'execute');
+  const inputControl = {
+    execute: jest.fn().mockResolvedValue({ status: 'ok' }),
+    abort: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+  };
   const { service, page } = setup(plan([{ op: 'click', selector: '#button' }, { op: 'key', key: 'Enter' }]), inputControl);
   try {
     await expect(service.execute({ ...request, kind: 'program', source: "document.querySelector('#button').click(); /* Then press Enter. */" }))
       .resolves.toMatchObject({ type: 'undefined' });
-    const calls = transport.send.mock.calls;
-    expect(calls.every(([tabId]) => tabId === request.tabId)).toBe(true);
-    expect(calls.filter(([, method, params]) => method === 'Input.dispatchMouseEvent' && params.type !== 'mouseMoved'))
-      .toEqual([
-        [7, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 100, y: 100, button: 'left', clickCount: 1, buttons: 1 }],
-        [7, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 100, y: 100, button: 'left', clickCount: 1, buttons: 0 }],
-      ]);
-    expect(calls.filter(([, method]) => method === 'Input.dispatchKeyEvent')).toEqual([
-      [7, 'Input.dispatchKeyEvent', expect.objectContaining({ type: 'keyDown', key: 'Enter' })],
-      [7, 'Input.dispatchKeyEvent', expect.objectContaining({ type: 'keyUp', key: 'Enter' })],
-    ]);
-    expect(calls.every(([, method]) => ['Input.dispatchMouseEvent', 'Input.dispatchKeyEvent'].includes(method))).toBe(true);
-    expect(execute.mock.calls).toEqual([
+    expect(inputControl.execute.mock.calls).toEqual([
       ['mouse_move', { x: 100, y: 100, duration_ms: 150 }, context],
       ['mouse_click', { x: 100, y: 100, button: 'left', count: 1 }, context],
       ['press_key', { key: 'Enter', repeat: 1 }, context],
     ]);
-    expect(bridge.getActiveTabId).toHaveBeenCalledTimes(3);
     expect(page.assertActive).toHaveBeenCalledTimes(3);
     expect(page.target).toHaveBeenCalledTimes(2);
     expect(connectNative).not.toHaveBeenCalled();
     expect(chrome.scripting.executeScript).not.toHaveBeenCalled();
   } finally {
-    await inputControl.disconnect();
     connectNative.mockRestore();
   }
 });

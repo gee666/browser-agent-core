@@ -86,4 +86,4 @@ Model output must be exactly one JSON object, not markdown or embedded code. Val
 npm test -- --runInBand tests/background/native-script.test.js tests/background/native-script-page.test.js
 ```
 
-Tests cover input-interface validation, rejection of request backend injection, translated click/key execution through the actual CDP bridge with mocked transport and no native host, whole-plan validation, common reads/results, native command ordering, caret positioning, hover geometry refresh, offscreen and nested clipping, hit-testing, absolute scroll clamping, inactive tabs/windows, provider/input failures, cancellation during translation/input, abort failures, timeouts and the global lock.
+Tests cover input-interface validation, rejection of request backend injection, translated click/key execution through a duck-typed adapter with no native host, whole-plan validation, common reads/results, native command ordering, caret positioning, hover geometry refresh, offscreen and nested clipping, hit-testing, absolute scroll clamping, inactive tabs/windows, provider/input failures, cancellation during translation/input, abort failures, timeouts and the global lock.
