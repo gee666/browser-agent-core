@@ -8,7 +8,7 @@ A reusable Chrome extension framework for LLM-driven browser automation. It prov
 
 1. **Page state extraction** — reading interactive elements, scroll position, and viewport dimensions from the live DOM.
 2. **LLM reasoning** — sending page state (and optionally a screenshot) to a language model and parsing its JSON response.
-3. **Action execution** — translating LLM-chosen actions into real input events via the `python-input-control` native messaging host.
+3. **Action execution** — translating LLM-chosen actions into input events through the runtime's configured Python or CDP input bridge.
 
 ## Exports
 
@@ -48,7 +48,7 @@ Everything needed in the extension service worker / background script:
 ## Requirements
 
 - Chrome / Chromium with Manifest V3 extension support
-- [`python-input-control`](https://github.com/your-org/python-input-control) installed and registered as a native messaging host — this is the bridge that translates action commands into real OS-level mouse/keyboard events
+- An input backend selected by the embedding runtime. The default `InputControlBridge` requires `python-input-control` installed and registered as a native messaging host. The sibling [`browser-agent-input-control`](../browser-agent-input-control/README.md) package provides `CdpInputControlBridge`, which uses Chrome's debugger API and needs no Python host.
 
 ## Usage
 
@@ -80,19 +80,20 @@ The executor never calls `bridge.focusElement`, `bridge.scrollElementIntoView` o
 
 ## External JavaScript through native input
 
-`NativeScriptService` sends every external source string, including read-only expressions, to the configured AI provider. It validates a bounded JSON plan and interprets supported input, reads and return expressions. It never executes supplied or generated JavaScript. Input uses only the Python `InputControlBridge`; no CDP backend or DOM-input fallback is accepted.
+`NativeScriptService` sends every external source string, including read-only expressions, to the configured AI provider. It validates a bounded JSON plan and interprets supported input, reads and return expressions. It never executes supplied or generated JavaScript. Input uses the trusted constructor's `inputControl`, which must implement `execute(command, params, context)`, `abort()` and `disconnect()`. The embedding runtime injects its selected Python or CDP bridge. If omitted, it defaults to the Python `InputControlBridge`. External requests cannot select or inject a backend, and there is no DOM-input fallback.
 
 ```javascript
-import { NativeScriptService, InputControlBridge } from 'browser-agent-core/background';
+import { NativeScriptService } from 'browser-agent-core/background';
 
-const scripts = new NativeScriptService({ llm, inputControl: new InputControlBridge() });
+// Reuse the runtime's configured inputControl, also passed to ActionExecutor.
+const scripts = new NativeScriptService({ llm, inputControl });
 const result = await scripts.executeExternalScript({
   tabId, kind: 'expression', source: 'document.title', args: [], signal,
 });
 // { value: 'Example', type: 'string', subtype: undefined }
 ```
 
-The default adapter supplies geometry and screen context without an extractor dependency. Native actions require the target tab to be active and its Chrome window focused. Overlapping script requests reject through a module-wide busy lock. Abort and timeout stop subsequent actions and abort active native input.
+The default adapter supplies geometry and screen context without an extractor dependency. Native actions require the target tab to be active and its Chrome window focused. Overlapping script requests reject through a module-wide busy lock. Abort and timeout stop subsequent actions and abort active input. Core handles both synchronous and promise-returning `abort()` methods, including failures. The runtime must await `disconnect()` before releasing its shared input lock.
 
 This is a supported-subset translator, not a full JavaScript runtime. Common DOM reads, selector input, relative/absolute native scrolling, typed JSON results and basic arithmetic are supported. Arbitrary page functions, network calls, unsupported DOM mutation and unrepresentable results reject. Validation enforces allowed operations but does not prove that AI translation preserved source semantics. See [the API, supported subset and failure rules](docs/native-scripts.md).
 

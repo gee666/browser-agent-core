@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { NativeScriptService, NativeScriptError } from '../../background/native-script.js';
 import { InputControlBridge } from '../../background/input-control.js';
+import { CdpInputControlBridge } from '../../../browser-agent-input-control/index.js';
 import { validateScriptPlan, evaluateScriptValue, checkJSON } from '../../background/native-script-plan.js';
 
 const literal = value => ({ kind: 'literal', value });
@@ -9,11 +10,10 @@ const plan = (steps = [], result = { kind: 'undefined' }) => ({ version: 1, step
 const context = { screenX: 0, screenY: 0, outerHeight: 900, innerHeight: 800, outerWidth: 1000, innerWidth: 1000, devicePixelRatio: 1, scrollX: 0, scrollY: 0 };
 const state = { context, width: 1000, height: 800, url: 'https://example.test/', visible: true, editable: true, x: 100, y: 100, scrollX: 0, scrollY: 0, pageWidth: 1000, pageHeight: 4000 };
 const request = { tabId: 7, kind: 'expression', source: 'document.title' };
-function setup(p = plan()) {
+function setup(p = plan(), inputControl = Object.assign(new InputControlBridge(), {
+  execute: jest.fn().mockResolvedValue({ status: 'ok' }), abort: jest.fn(),
+})) {
   const llm = { complete: jest.fn().mockResolvedValue(JSON.stringify(p)) };
-  const inputControl = new InputControlBridge();
-  inputControl.execute = jest.fn().mockResolvedValue({ status: 'ok' });
-  inputControl.abort = jest.fn();
   const page = {
     snapshot: jest.fn().mockResolvedValue(state), target: jest.fn().mockResolvedValue(state),
     read: jest.fn().mockResolvedValue('Example'), assertActive: jest.fn().mockResolvedValue(undefined),
@@ -22,9 +22,75 @@ function setup(p = plan()) {
 }
 const read = { op: 'read', id: 'title', property: 'title' };
 
-it('requires an AI provider and rejects non-python input bridges', () => {
+it('requires an AI provider and defaults to Python without connecting at construction', () => {
   expect(() => new NativeScriptService()).toThrow(NativeScriptError);
-  expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl: { execute() {} } })).toThrow(/python/);
+  const service = new NativeScriptService({ llm: { complete() {} } });
+  expect(service._inputControl).toBeInstanceOf(InputControlBridge);
+  expect(chrome.runtime.connectNative).not.toHaveBeenCalled();
+});
+
+it.each([null, {}, { execute() {} }])('rejects incomplete input interfaces: %j', inputControl => {
+  expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl }))
+    .toThrow('Input control must implement execute, abort and disconnect');
+});
+
+it.each(['execute', 'abort', 'disconnect'])('requires a callable %s on the trusted input interface', method => {
+  const inputControl = { execute() {}, abort() {}, disconnect() {} };
+  expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl })).not.toThrow();
+  delete inputControl[method];
+  expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl })).toThrow(NativeScriptError);
+  inputControl[method] = true;
+  expect(() => new NativeScriptService({ llm: { complete() {} }, inputControl })).toThrow(NativeScriptError);
+});
+
+it('translates click and key input through the actual CDP bridge without a native host', async () => {
+  const connectNative = jest.spyOn(chrome.runtime, 'connectNative').mockImplementation(() => {
+    throw new Error('No native host installed');
+  });
+  const transport = { send: jest.fn().mockResolvedValue({}), detach: jest.fn().mockResolvedValue(undefined), dispose: jest.fn() };
+  const bridge = { getActiveTabId: jest.fn().mockResolvedValue(request.tabId) };
+  const inputControl = new CdpInputControlBridge({ bridge, transport });
+  const execute = jest.spyOn(inputControl, 'execute');
+  const { service, page } = setup(plan([{ op: 'click', selector: '#button' }, { op: 'key', key: 'Enter' }]), inputControl);
+  try {
+    await expect(service.execute({ ...request, kind: 'program', source: "document.querySelector('#button').click(); /* Then press Enter. */" }))
+      .resolves.toMatchObject({ type: 'undefined' });
+    const calls = transport.send.mock.calls;
+    expect(calls.every(([tabId]) => tabId === request.tabId)).toBe(true);
+    expect(calls.filter(([, method, params]) => method === 'Input.dispatchMouseEvent' && params.type !== 'mouseMoved'))
+      .toEqual([
+        [7, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: 100, y: 100, button: 'left', clickCount: 1, buttons: 1 }],
+        [7, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: 100, y: 100, button: 'left', clickCount: 1, buttons: 0 }],
+      ]);
+    expect(calls.filter(([, method]) => method === 'Input.dispatchKeyEvent')).toEqual([
+      [7, 'Input.dispatchKeyEvent', expect.objectContaining({ type: 'keyDown', key: 'Enter' })],
+      [7, 'Input.dispatchKeyEvent', expect.objectContaining({ type: 'keyUp', key: 'Enter' })],
+    ]);
+    expect(calls.every(([, method]) => ['Input.dispatchMouseEvent', 'Input.dispatchKeyEvent'].includes(method))).toBe(true);
+    expect(execute.mock.calls).toEqual([
+      ['mouse_move', { x: 100, y: 100, duration_ms: 150 }, context],
+      ['mouse_click', { x: 100, y: 100, button: 'left', count: 1 }, context],
+      ['press_key', { key: 'Enter', repeat: 1 }, context],
+    ]);
+    expect(bridge.getActiveTabId).toHaveBeenCalledTimes(3);
+    expect(page.assertActive).toHaveBeenCalledTimes(3);
+    expect(page.target).toHaveBeenCalledTimes(2);
+    expect(connectNative).not.toHaveBeenCalled();
+    expect(chrome.scripting.executeScript).not.toHaveBeenCalled();
+  } finally {
+    await inputControl.disconnect();
+    connectNative.mockRestore();
+  }
+});
+
+it.each(['inputControl', 'backend', 'page'])('rejects external %s injection before translation or input', async field => {
+  const injected = { execute: jest.fn(), abort: jest.fn(), disconnect: jest.fn() };
+  const { service, llm, page, inputControl } = setup(plan([{ op: 'key', key: 'Enter' }]));
+  await expect(service.execute({ ...request, [field]: injected })).rejects.toMatchObject({ code: 'E_SCRIPT_REQUEST' });
+  expect(llm.complete).not.toHaveBeenCalled();
+  expect(page.snapshot).not.toHaveBeenCalled();
+  expect(inputControl.execute).not.toHaveBeenCalled();
+  expect(injected.execute).not.toHaveBeenCalled();
 });
 
 it('translates read-only source with the configured provider and returns normalized live values', async () => {
@@ -241,6 +307,26 @@ it('aborts the native host mid-input and never executes subsequent commands', as
   await expect(pending).rejects.toMatchObject({ code: 'E_SCRIPT_ABORTED' });
   expect(inputControl.abort).toHaveBeenCalledTimes(1);
   expect(inputControl.execute).toHaveBeenCalledTimes(1);
+});
+
+it.each(['reject', 'throw'])('preserves cancellation when input abort fails: %s', async failure => {
+  const { service, inputControl } = setup(plan([{ op: 'key', key: 'Enter' }, { op: 'key', key: 'Tab' }]));
+  const controller = new AbortController();
+  const cause = new Error('abort failed');
+  inputControl.abort.mockImplementation(() => {
+    if (failure === 'throw') throw cause;
+    return Promise.reject(cause);
+  });
+  inputControl.execute.mockImplementation(() => {
+    controller.abort();
+    return new Promise(() => {});
+  });
+  await expect(service.execute({ ...request, signal: controller.signal })).rejects.toMatchObject({ code: 'E_SCRIPT_ABORTED' });
+  expect(inputControl.abort).toHaveBeenCalledTimes(1);
+  expect(inputControl.execute).toHaveBeenCalledTimes(1);
+  // Let rejected abort promises settle; Jest will fail on unhandled rejections.
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await expect(setup().service.execute(request)).resolves.toMatchObject({ type: 'undefined' });
 });
 
 it('times out translation and releases the process-wide lock', async () => {

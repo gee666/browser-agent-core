@@ -12,7 +12,10 @@ const allowedRequest = new Set(['tabId', 'kind', 'source', 'args', 'awaitPromise
 export class NativeScriptService {
   constructor({ llm, inputControl = new InputControlBridge(), page = new NativeScriptPageBridge() } = {}) {
     if (!llm || typeof llm.complete !== 'function') fail('E_SCRIPT_CONFIG', 'A configured AI provider is required');
-    if (!(inputControl instanceof InputControlBridge)) fail('E_SCRIPT_CONFIG', 'Native scripts require the python InputControlBridge');
+    // Trusted runtime dependency, never selected or supplied by external requests.
+    if (!inputControl || ['execute', 'abort', 'disconnect'].some(method => typeof inputControl[method] !== 'function')) {
+      fail('E_SCRIPT_CONFIG', 'Input control must implement execute, abort and disconnect');
+    }
     this._llm = llm;
     this._inputControl = inputControl;
     this._page = page;
@@ -49,7 +52,13 @@ export class NativeScriptService {
       if (controller.signal.aborted) return;
       cancelError = new NativeScriptError(code, message);
       controller.abort();
-      if (nativeActive) this._inputControl.abort();
+      if (nativeActive) {
+        // CDP abort may return a promise; Python abort is synchronous. Keep the
+        // cancellation error even if abort fails. The runtime awaits disconnect
+        // before releasing its input lock.
+        try { Promise.resolve(this._inputControl.abort()).catch(() => {}); }
+        catch { /* Preserve the request's cancellation error. */ }
+      }
     };
     const onAbort = () => cancel('E_SCRIPT_ABORTED', 'Script request aborted');
     const check = () => { if (controller.signal.aborted) throw cancelError; };
