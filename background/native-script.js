@@ -10,7 +10,7 @@ let busy = false;
 const allowedRequest = new Set(['tabId', 'kind', 'source', 'args', 'awaitPromise', 'returnByValue', 'captureConsole', 'timeoutMs', 'signal']);
 
 export class NativeScriptService {
-  constructor({ llm, inputControl = new InputControlBridge(), page = new NativeScriptPageBridge() } = {}) {
+  constructor({ llm, inputControl = new InputControlBridge(), page = new NativeScriptPageBridge(), requiresActiveTab = true } = {}) {
     if (!llm || typeof llm.complete !== 'function') fail('E_SCRIPT_CONFIG', 'A configured AI provider is required');
     // Trusted runtime dependency, never selected or supplied by external requests.
     if (!inputControl || ['execute', 'abort', 'disconnect'].some(method => typeof inputControl[method] !== 'function')) {
@@ -19,6 +19,8 @@ export class NativeScriptService {
     this._llm = llm;
     this._inputControl = inputControl;
     this._page = page;
+    // Only the trusted embedding may opt out, and only for tab-scoped input.
+    this._requiresActiveTab = requiresActiveTab !== false;
   }
 
   execute(request) { return this.executeExternalScript(request); }
@@ -80,7 +82,7 @@ export class NativeScriptService {
       // Refresh native screen context for EVERY command, including keyboard-only
       // steps and later commands in a type sequence. Never reuse cached offsets.
       const fresh = await wait(this._page.snapshot(tabId));
-      await wait(this._page.assertActive(tabId));
+      if (this._requiresActiveTab) await wait(this._page.assertActive(tabId));
       check();
       if (snapshot?.url !== undefined && fresh.url !== snapshot.url) fail('E_SCRIPT_TARGET', 'Page changed before native input');
       snapshot = fresh;
